@@ -1,0 +1,146 @@
+name: SSH systemd deploy
+
+# Reusable workflow — atomic releases-style deploy for Bun/Node apps behind
+# systemd. Pattern:
+#   1. SSH to remote host
+#   2. rsync source to /opt/<service>/releases/<sha>/
+#   3. run install / build / migrate inside that release dir
+#   4. swap /opt/<service>/current -> /opt/<service>/releases/<sha>
+#   5. systemctl restart <service>
+#   6. health check on /api/health (configurable)
+#
+# Releases are kept; rollback = re-point the symlink.
+# On failure, calls notify-failure.yml.
+
+on:
+  workflow_call:
+    inputs:
+      service:
+        required: true
+        type: string
+        description: "Service name (used as systemd unit name + alert label + release dir)"
+      install_cmd:
+        required: false
+        type: string
+        default: "bun install --frozen-lockfile"
+      build_cmd:
+        required: false
+        type: string
+        default: "bun run build"
+      migrate_cmd:
+        required: false
+        type: string
+        default: ""
+        description: "DB migration command (e.g. 'bunx prisma migrate deploy'). Empty = skip."
+      health_url:
+        required: false
+        type: string
+        default: ""
+        description: "URL to GET 200 from after restart (e.g. https://delvix.cloud/api/health). Empty = skip."
+      keep_releases:
+        required: false
+        type: number
+        default: 5
+        description: "How many past release dirs to keep on the host"
+
+    secrets:
+      SSH_HOST:
+        required: true
+      SSH_KEY:
+        required: true
+      ALERTMANAGER_URL:
+        required: true
+      ALERTMANAGER_USER:
+        required: true
+      ALERTMANAGER_PASSWORD:
+        required: true
+
+concurrency:
+  group: ${{ inputs.service }}-deploy
+  cancel-in-progress: false   # don't cancel an in-flight deploy mid-symlink-swap
+
+jobs:
+  deploy:
+    name: Deploy ${{ inputs.service }}
+    runs-on: ubuntu-latest
+    env:
+      SERVICE: ${{ inputs.service }}
+      RELEASE_ROOT: /opt/${{ inputs.service }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure SSH
+        env:
+          SSH_KEY: ${{ secrets.SSH_KEY }}
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H "$SSH_HOST" >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Rsync to release dir
+        env:
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+        run: |
+          REL_DIR="$RELEASE_ROOT/releases/$GITHUB_SHA"
+          ssh "root@$SSH_HOST" "install -m 755 -d '$REL_DIR'"
+          rsync -azv \
+            --exclude=.git --exclude=node_modules --exclude=.next \
+            --exclude=target --exclude=dist \
+            ./ "root@$SSH_HOST:$REL_DIR/"
+
+      - name: Install + build + migrate
+        env:
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+        run: |
+          REL_DIR="$RELEASE_ROOT/releases/$GITHUB_SHA"
+          ssh "root@$SSH_HOST" "set -eu; cd '$REL_DIR'; \
+            [ -d \"$RELEASE_ROOT/shared\" ] && [ -f \"$RELEASE_ROOT/shared/.env\" ] && ln -sf \"$RELEASE_ROOT/shared/.env\" .env || true; \
+            ${{ inputs.install_cmd }}; \
+            ${{ inputs.build_cmd }}; \
+            ${{ inputs.migrate_cmd || 'true' }}"
+
+      - name: Atomic symlink swap + restart
+        env:
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+        run: |
+          REL_DIR="$RELEASE_ROOT/releases/$GITHUB_SHA"
+          ssh "root@$SSH_HOST" "set -eu; \
+            ln -snf '$REL_DIR' '$RELEASE_ROOT/current'; \
+            systemctl restart '$SERVICE'; \
+            sleep 2; \
+            systemctl is-active '$SERVICE'"
+
+      - name: Health check
+        if: inputs.health_url != ''
+        run: |
+          for i in 1 2 3 4 5 6 7 8 9 10; do
+            code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "${{ inputs.health_url }}")
+            if [ "$code" = "200" ]; then
+              echo "✅ health check 200 after $i attempts"
+              exit 0
+            fi
+            echo "attempt $i: got $code, retrying..."
+            sleep 3
+          done
+          echo "❌ health check never returned 200"
+          exit 1
+
+      - name: Prune old releases
+        env:
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          KEEP: ${{ inputs.keep_releases }}
+        run: |
+          ssh "root@$SSH_HOST" "cd '$RELEASE_ROOT/releases' && ls -1t | tail -n +$((KEEP + 1)) | xargs -r rm -rf"
+
+  notify:
+    name: Notify on failure
+    needs: deploy
+    if: failure()
+    uses: 021is/ci/.github/workflows/notify-failure.yml@main
+    with:
+      project: ${{ inputs.service }}
+      alertname: ${{ inputs.service }}-deploy-failed
+      severity: critical
+    secrets: inherit

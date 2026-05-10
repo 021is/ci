@@ -1,0 +1,70 @@
+name: Notify failure
+
+# Reusable workflow — posts a single alert to Alertmanager when called.
+# Alertmanager fans out to Telegram + email per its configured receivers.
+# Call from any deploy/CI workflow on failure() to get unified alerting.
+
+on:
+  workflow_call:
+    inputs:
+      project:
+        required: true
+        type: string
+        description: "Project label for the alert (e.g. 021-vault, delvix, parked)"
+      alertname:
+        required: true
+        type: string
+        description: "PromQL-style alert name (e.g. VaultDeployFailed, DelvixDeployFailed)"
+      severity:
+        required: false
+        type: string
+        default: critical
+        description: "critical | warning | info"
+    secrets:
+      ALERTMANAGER_URL:
+        required: true
+      ALERTMANAGER_USER:
+        required: true
+      ALERTMANAGER_PASSWORD:
+        required: true
+
+jobs:
+  push:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Push to Alertmanager
+        env:
+          AM_URL: ${{ secrets.ALERTMANAGER_URL }}
+          AM_USER: ${{ secrets.ALERTMANAGER_USER }}
+          AM_PASS: ${{ secrets.ALERTMANAGER_PASSWORD }}
+        run: |
+          set -eu
+          STARTS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          PAYLOAD=$(jq -nc \
+            --arg starts   "$STARTS" \
+            --arg sha      "${GITHUB_SHA::8}" \
+            --arg actor    "$GITHUB_ACTOR" \
+            --arg ref      "$GITHUB_REF_NAME" \
+            --arg url      "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            --arg project  "${{ inputs.project }}" \
+            --arg alertname "${{ inputs.alertname }}" \
+            --arg severity "${{ inputs.severity }}" \
+            '[{
+              startsAt: $starts,
+              labels: {
+                alertname: $alertname,
+                project: $project,
+                severity: $severity,
+                sha: $sha,
+                actor: $actor,
+                ref: $ref
+              },
+              annotations: {
+                summary: ($alertname + " on commit " + $sha),
+                run_url: $url
+              }
+            }]')
+          curl -fsS -u "$AM_USER:$AM_PASS" -X POST "$AM_URL" \
+            -H 'Content-Type: application/json' \
+            --data "$PAYLOAD"
+          echo "✅ alert posted to Alertmanager"

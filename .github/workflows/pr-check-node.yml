@@ -1,0 +1,66 @@
+name: PR check (Node/TS)
+
+# Reusable workflow — typecheck + lint + build dry-run for any Node/TS repo.
+# Call from a PR-triggered workflow in each consumer repo.
+
+on:
+  workflow_call:
+    inputs:
+      runtime:
+        required: false
+        type: string
+        default: bun
+        description: "bun | node — which runtime to install"
+      node_version:
+        required: false
+        type: string
+        default: "22"
+      install_cmd:
+        required: false
+        type: string
+        default: ""
+        description: "Override install command. Default: bun install --frozen-lockfile (bun) or npm ci (node)."
+      typecheck_cmd:
+        required: false
+        type: string
+        default: ""
+        description: "Override. Default: bun run typecheck (bun) or npm run typecheck (node)."
+      lint_cmd:
+        required: false
+        type: string
+        default: ""
+        description: "Override. Default: bun run lint || true (bun) or npm run lint || true (node)."
+      build_cmd:
+        required: false
+        type: string
+        default: ""
+        description: "Override. Default: bun run build (bun) or npm run build (node)."
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Bun
+        if: inputs.runtime == 'bun'
+        uses: oven-sh/setup-bun@v2
+
+      - name: Setup Node
+        if: inputs.runtime == 'node'
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node_version }}
+          cache: npm
+
+      - name: Install
+        run: ${{ inputs.install_cmd || (inputs.runtime == 'bun' && 'bun install --frozen-lockfile' || 'npm ci') }}
+
+      - name: Typecheck
+        run: ${{ inputs.typecheck_cmd || (inputs.runtime == 'bun' && 'bun run typecheck' || 'npm run typecheck') }}
+
+      - name: Lint
+        run: ${{ inputs.lint_cmd || (inputs.runtime == 'bun' && 'bun run lint || true' || 'npm run lint || true') }}
+
+      - name: Build
+        run: ${{ inputs.build_cmd || (inputs.runtime == 'bun' && 'bun run build' || 'npm run build') }}

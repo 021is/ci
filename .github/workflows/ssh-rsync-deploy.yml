@@ -1,0 +1,104 @@
+name: SSH rsync deploy
+
+# Reusable workflow — rsync sources to a remote host over SSH, then run a
+# post-deploy script. Designed for static/file-based deploys: Caddy configs,
+# docker-compose stacks, simple HTML, Vaultwarden, etc.
+#
+# On failure, calls notify-failure.yml so the deploy alert flows through the
+# same Alertmanager → Telegram pipeline as every other job.
+
+on:
+  workflow_call:
+    inputs:
+      service:
+        required: true
+        type: string
+        description: "Service label (used in alert + concurrency group)"
+      remote_path:
+        required: true
+        type: string
+        description: "Destination dir on the remote host (e.g. /opt/vaultwarden)"
+      rsync_paths:
+        required: false
+        type: string
+        default: "."
+        description: "Space-separated list of local paths to rsync (relative to repo root). Default: everything."
+      rsync_excludes:
+        required: false
+        type: string
+        default: ".git\nnode_modules\n.next\ntarget\ndist"
+        description: "Newline-separated rsync --exclude patterns"
+      post_deploy:
+        required: false
+        type: string
+        default: ""
+        description: "Bash to run on the remote host after rsync (e.g. 'docker compose up -d')"
+      remote_user:
+        required: false
+        type: string
+        default: root
+        description: "SSH user on the remote host"
+
+    secrets:
+      SSH_HOST:
+        required: true
+      SSH_KEY:
+        required: true
+      ALERTMANAGER_URL:
+        required: true
+      ALERTMANAGER_USER:
+        required: true
+      ALERTMANAGER_PASSWORD:
+        required: true
+
+concurrency:
+  group: ${{ inputs.service }}-deploy
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    name: Deploy ${{ inputs.service }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure SSH
+        env:
+          SSH_KEY: ${{ secrets.SSH_KEY }}
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H "$SSH_HOST" >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Rsync sources
+        env:
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          USER: ${{ inputs.remote_user }}
+        run: |
+          set -eu
+          excludes=""
+          while IFS= read -r pat; do
+            [ -n "$pat" ] && excludes="$excludes --exclude=$pat"
+          done <<< "${{ inputs.rsync_excludes }}"
+          rsync -azv $excludes ${{ inputs.rsync_paths }} "${USER}@${SSH_HOST}:${{ inputs.remote_path }}"
+
+      - name: Post-deploy commands
+        if: inputs.post_deploy != ''
+        env:
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          USER: ${{ inputs.remote_user }}
+        run: |
+          ssh "${USER}@${SSH_HOST}" 'set -eu; ${{ inputs.post_deploy }}'
+
+  notify:
+    name: Notify on failure
+    needs: deploy
+    if: failure()
+    uses: 021is/ci/.github/workflows/notify-failure.yml@main
+    with:
+      project: ${{ inputs.service }}
+      alertname: ${{ inputs.service }}-deploy-failed
+      severity: critical
+    secrets: inherit

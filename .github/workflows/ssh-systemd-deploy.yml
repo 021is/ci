@@ -2,12 +2,13 @@ name: SSH systemd deploy
 
 # Reusable workflow — atomic releases-style deploy for Bun/Node apps behind
 # systemd. Pattern:
-#   1. SSH to remote host
+#   1. SSH to remote host (as remote_user, default: root)
 #   2. rsync source to /opt/<service>/releases/<sha>/
 #   3. run install / build / migrate inside that release dir
 #   4. swap /opt/<service>/current -> /opt/<service>/releases/<sha>
-#   5. systemctl restart <service>
-#   6. health check on /api/health (configurable)
+#   5. systemctl restart <service> (with optional sudo)
+#   6. health check on health_url (configurable)
+#   7. prune old releases
 #
 # Releases are kept; rollback = re-point the symlink.
 # On failure, calls notify-failure.yml.
@@ -19,6 +20,26 @@ on:
         required: true
         type: string
         description: "Service name (used as systemd unit name + alert label + release dir)"
+      remote_user:
+        required: false
+        type: string
+        default: root
+        description: "SSH user on the remote host"
+      use_sudo:
+        required: false
+        type: boolean
+        default: false
+        description: "Prepend sudo to systemctl commands (when remote_user is non-root and has restricted sudoers entry)"
+      release_root:
+        required: false
+        type: string
+        default: ""
+        description: "Override release root. Default: /opt/<service>"
+      env_symlink_src:
+        required: false
+        type: string
+        default: ""
+        description: "If set, symlink this path to .env.local inside each release (e.g. /opt/delvix/shared/.env)"
       install_cmd:
         required: false
         type: string
@@ -27,6 +48,11 @@ on:
         required: false
         type: string
         default: "bun run build"
+      pre_build_cmd:
+        required: false
+        type: string
+        default: ""
+        description: "Commands to run after install, before build (e.g. 'bunx prisma generate')"
       migrate_cmd:
         required: false
         type: string
@@ -36,12 +62,16 @@ on:
         required: false
         type: string
         default: ""
-        description: "URL to GET 200 from after restart (e.g. https://delvix.cloud/api/health). Empty = skip."
+        description: "URL to GET 200 from after restart. Empty = skip."
       keep_releases:
         required: false
         type: number
         default: 5
         description: "How many past release dirs to keep on the host"
+      rsync_excludes:
+        required: false
+        type: string
+        default: ".git\nnode_modules\n.next\ntarget\ndist\n.env*"
 
     secrets:
       SSH_HOST:
@@ -63,9 +93,6 @@ jobs:
   deploy:
     name: Deploy ${{ inputs.service }}
     runs-on: ubuntu-latest
-    env:
-      SERVICE: ${{ inputs.service }}
-      RELEASE_ROOT: /opt/${{ inputs.service }}
     steps:
       - uses: actions/checkout@v4
 
@@ -79,50 +106,74 @@ jobs:
           chmod 600 ~/.ssh/id_ed25519
           ssh-keyscan -H "$SSH_HOST" >> ~/.ssh/known_hosts 2>/dev/null
 
+      - name: Compute paths
+        id: paths
+        run: |
+          ROOT="${{ inputs.release_root }}"
+          [ -z "$ROOT" ] && ROOT="/opt/${{ inputs.service }}"
+          echo "release_root=$ROOT" >> "$GITHUB_OUTPUT"
+          echo "release_dir=$ROOT/releases/$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+          if [ "${{ inputs.use_sudo }}" = "true" ]; then
+            echo "systemctl=sudo /usr/bin/systemctl" >> "$GITHUB_OUTPUT"
+          else
+            echo "systemctl=systemctl" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Rsync to release dir
         env:
           SSH_HOST: ${{ secrets.SSH_HOST }}
+          USER: ${{ inputs.remote_user }}
+          REL_DIR: ${{ steps.paths.outputs.release_dir }}
         run: |
-          REL_DIR="$RELEASE_ROOT/releases/$GITHUB_SHA"
-          ssh "root@$SSH_HOST" "install -m 755 -d '$REL_DIR'"
-          rsync -azv \
-            --exclude=.git --exclude=node_modules --exclude=.next \
-            --exclude=target --exclude=dist \
-            ./ "root@$SSH_HOST:$REL_DIR/"
+          set -eu
+          excludes=""
+          while IFS= read -r pat; do
+            [ -n "$pat" ] && excludes="$excludes --exclude=$pat"
+          done <<< "${{ inputs.rsync_excludes }}"
+          ssh "${USER}@${SSH_HOST}" "install -m 755 -d '$REL_DIR'"
+          rsync -azv $excludes ./ "${USER}@${SSH_HOST}:${REL_DIR}/"
 
-      - name: Install + build + migrate
+      - name: Install + (prisma) + build + migrate
         env:
           SSH_HOST: ${{ secrets.SSH_HOST }}
+          USER: ${{ inputs.remote_user }}
+          REL_DIR: ${{ steps.paths.outputs.release_dir }}
+          ROOT: ${{ steps.paths.outputs.release_root }}
         run: |
-          REL_DIR="$RELEASE_ROOT/releases/$GITHUB_SHA"
-          ssh "root@$SSH_HOST" "set -eu; cd '$REL_DIR'; \
-            [ -d \"$RELEASE_ROOT/shared\" ] && [ -f \"$RELEASE_ROOT/shared/.env\" ] && ln -sf \"$RELEASE_ROOT/shared/.env\" .env || true; \
+          ssh "${USER}@${SSH_HOST}" "set -eu; cd '$REL_DIR'; \
+            if [ -n '${{ inputs.env_symlink_src }}' ]; then ln -sfn '${{ inputs.env_symlink_src }}' .env.local; fi; \
             ${{ inputs.install_cmd }}; \
+            ${{ inputs.pre_build_cmd || 'true' }}; \
             ${{ inputs.build_cmd }}; \
             ${{ inputs.migrate_cmd || 'true' }}"
 
       - name: Atomic symlink swap + restart
         env:
           SSH_HOST: ${{ secrets.SSH_HOST }}
+          USER: ${{ inputs.remote_user }}
+          REL_DIR: ${{ steps.paths.outputs.release_dir }}
+          ROOT: ${{ steps.paths.outputs.release_root }}
+          SYSTEMCTL: ${{ steps.paths.outputs.systemctl }}
+          SERVICE: ${{ inputs.service }}
         run: |
-          REL_DIR="$RELEASE_ROOT/releases/$GITHUB_SHA"
-          ssh "root@$SSH_HOST" "set -eu; \
-            ln -snf '$REL_DIR' '$RELEASE_ROOT/current'; \
-            systemctl restart '$SERVICE'; \
+          ssh "${USER}@${SSH_HOST}" "set -eu; \
+            ln -sfn '$REL_DIR' '$ROOT/current.new'; \
+            mv -Tf '$ROOT/current.new' '$ROOT/current'; \
+            $SYSTEMCTL restart '${SERVICE}.service'; \
             sleep 2; \
-            systemctl is-active '$SERVICE'"
+            $SYSTEMCTL is-active '${SERVICE}.service'"
 
       - name: Health check
         if: inputs.health_url != ''
         run: |
-          for i in 1 2 3 4 5 6 7 8 9 10; do
+          for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
             code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "${{ inputs.health_url }}")
             if [ "$code" = "200" ]; then
               echo "✅ health check 200 after $i attempts"
               exit 0
             fi
             echo "attempt $i: got $code, retrying..."
-            sleep 3
+            sleep 5
           done
           echo "❌ health check never returned 200"
           exit 1
@@ -130,9 +181,11 @@ jobs:
       - name: Prune old releases
         env:
           SSH_HOST: ${{ secrets.SSH_HOST }}
+          USER: ${{ inputs.remote_user }}
+          ROOT: ${{ steps.paths.outputs.release_root }}
           KEEP: ${{ inputs.keep_releases }}
         run: |
-          ssh "root@$SSH_HOST" "cd '$RELEASE_ROOT/releases' && ls -1t | tail -n +$((KEEP + 1)) | xargs -r rm -rf"
+          ssh "${USER}@${SSH_HOST}" "cd '$ROOT/releases' && ls -1t | tail -n +\$((KEEP + 1)) | xargs -r rm -rf"
 
   notify:
     name: Notify on failure

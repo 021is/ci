@@ -184,8 +184,20 @@ jobs:
           USER: ${{ inputs.remote_user }}
           ROOT: ${{ steps.paths.outputs.release_root }}
           KEEP: ${{ inputs.keep_releases }}
+          CURRENT_SHA: ${{ github.sha }}
         run: |
-          ssh "${USER}@${SSH_HOST}" "cd '$ROOT/releases' && ls -1t | tail -n +\$((KEEP + 1)) | xargs -r rm -rf"
+          # Interpolate KEEP + CURRENT_SHA + ROOT into the remote script (not
+          # the runner) — previous version expanded $KEEP on the SSH server
+          # side where the env var was unset, turning `tail -n +$((KEEP+1))`
+          # into `tail -n +1` and deleting EVERY release including the active
+          # one. Always exclude the SHA we just deployed from prune.
+          ssh "${USER}@${SSH_HOST}" bash -s <<REMOTE
+          set -eu
+          cd "$ROOT/releases"
+          for d in \$(ls -1t | grep -vx "$CURRENT_SHA" | tail -n +$KEEP); do
+            rm -rf -- "\$d"
+          done
+          REMOTE
 
   notify:
     name: Notify on failure

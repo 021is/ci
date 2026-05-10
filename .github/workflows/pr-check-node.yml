@@ -1,7 +1,7 @@
 name: PR check (Node/TS)
 
 # Reusable workflow — typecheck + lint + build dry-run for any Node/TS repo.
-# Call from a PR-triggered workflow in each consumer repo.
+# Call from a PR-triggered workflow OR as a pre-deploy quality gate.
 
 on:
   workflow_call:
@@ -20,6 +20,11 @@ on:
         type: string
         default: ""
         description: "Override install command. Default: bun install --frozen-lockfile (bun) or npm ci (node)."
+      pre_build_cmd:
+        required: false
+        type: string
+        default: ""
+        description: "Run between install and typecheck (e.g. 'bunx prisma generate')."
       typecheck_cmd:
         required: false
         type: string
@@ -35,6 +40,16 @@ on:
         type: string
         default: ""
         description: "Override. Default: bun run build (bun) or npm run build (node)."
+      build_env:
+        required: false
+        type: string
+        default: ""
+        description: "Multi-line KEY=VAL placeholder env for the build step (each on its own line). Use for repos whose build references prod env vars that have no CI equivalent."
+      skip_build:
+        required: false
+        type: boolean
+        default: false
+        description: "Skip the build step (when env requirements make a meaningful dry-run impossible)"
 
 jobs:
   check:
@@ -56,6 +71,10 @@ jobs:
       - name: Install
         run: ${{ inputs.install_cmd || (inputs.runtime == 'bun' && 'bun install --frozen-lockfile' || 'npm ci') }}
 
+      - name: Pre-build
+        if: inputs.pre_build_cmd != ''
+        run: ${{ inputs.pre_build_cmd }}
+
       - name: Typecheck
         run: ${{ inputs.typecheck_cmd || (inputs.runtime == 'bun' && 'bun run typecheck' || 'npm run typecheck') }}
 
@@ -63,4 +82,19 @@ jobs:
         run: ${{ inputs.lint_cmd || (inputs.runtime == 'bun' && 'bun run lint || true' || 'npm run lint || true') }}
 
       - name: Build
-        run: ${{ inputs.build_cmd || (inputs.runtime == 'bun' && 'bun run build' || 'npm run build') }}
+        if: inputs.skip_build == false
+        env:
+          BUILD_ENV_BLOCK: ${{ inputs.build_env }}
+        run: |
+          # Export each KEY=VAL line from build_env into the build's environment
+          if [ -n "$BUILD_ENV_BLOCK" ]; then
+            while IFS= read -r line; do
+              [ -z "$line" ] && continue
+              # Strip leading/trailing whitespace; export only valid KEY=VAL
+              line=$(echo "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+              case "$line" in
+                *=*) export "$line" ;;
+              esac
+            done <<< "$BUILD_ENV_BLOCK"
+          fi
+          ${{ inputs.build_cmd || (inputs.runtime == 'bun' && 'bun run build' || 'npm run build') }}

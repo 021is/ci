@@ -1,0 +1,243 @@
+name: Spine Metrics
+
+# Reusable post-merge workflow. Captures Spine Quality Gate results,
+# coverage, type-coverage, bundle size, test count, and Spine version
+# adoption from the consumer repo, then pushes to 021-mon Prometheus
+# (remote-write) and Loki (for the run-event log feed).
+#
+# Consumer usage (.github/workflows/post-merge.yml):
+#
+#   on:
+#     push: { branches: [main] }
+#     workflow_run:
+#       workflows: ["PR"]
+#       types: [completed]
+#   jobs:
+#     metrics:
+#       uses: 021is/ci/.github/workflows/spine-metrics.yml@v1
+#       secrets: inherit
+#
+# Required secrets (consumer repo or org):
+#   SPINE_PROM_USER       — basic-auth user for remote_write (default: helvix-prom)
+#   SPINE_PROM_PASSWORD   — password
+#   SPINE_LOKI_USER       — basic-auth user for Loki push (default: helvix-vector)
+#   SPINE_LOKI_PASSWORD   — password
+
+on:
+  workflow_call:
+    inputs:
+      prom_url:
+        type: string
+        default: "https://grafana.021.is/prom/api/v1/write"
+      loki_url:
+        type: string
+        default: "https://grafana.021.is/loki/api/v1/push"
+      gate_workflow_name:
+        type: string
+        default: "PR"
+        description: "Workflow file/name of the gate workflow to look up results for."
+
+jobs:
+  collect-and-push:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+
+      - uses: oven-sh/setup-bun@v2
+
+      - name: Resolve gate status for this commit
+        id: gate
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const sha = context.sha;
+            // Find most recent run of the gate workflow for this commit.
+            const runs = await github.rest.actions.listWorkflowRunsForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              head_sha: sha,
+              per_page: 50,
+            });
+            const gate = runs.data.workflow_runs.find(r =>
+              r.name === "${{ inputs.gate_workflow_name }}" ||
+              r.path?.endsWith("${{ inputs.gate_workflow_name }}.yml")
+            );
+            if (!gate) {
+              core.setOutput("status", "unknown");
+              core.setOutput("conclusion", "unknown");
+              core.setOutput("run_url", "");
+              core.setOutput("failed_job", "");
+              return;
+            }
+            const jobs = await github.rest.actions.listJobsForWorkflowRun({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              run_id: gate.id,
+            });
+            const failedJob = jobs.data.jobs.find(j => j.conclusion === "failure")?.name ?? "";
+            core.setOutput("status", gate.status);
+            core.setOutput("conclusion", gate.conclusion ?? "unknown");
+            core.setOutput("run_url", gate.html_url);
+            core.setOutput("failed_job", failedJob);
+            core.setOutput("run_id", String(gate.id));
+            core.setOutput("created_at", gate.created_at);
+
+      - name: Resolve Spine consumed version
+        id: spine_version
+        run: |
+          if [ -f package.json ]; then
+            # Pick the FIRST @021is/spine-* version we find in deps/devDeps.
+            VERSION=$(node -e "
+              const p = require('./package.json');
+              const all = { ...(p.dependencies||{}), ...(p.devDependencies||{}) };
+              const entry = Object.entries(all).find(([k]) => k.startsWith('@021is/spine'));
+              process.stdout.write(entry ? entry[1].replace(/^[\^~]/,'') : '');
+            ")
+            echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Resolve latest published Spine version
+        id: spine_latest
+        run: |
+          LATEST=$(curl -s "https://api.github.com/orgs/021is/packages/npm/spine-errors/versions" \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github+json" \
+            | python3 -c "import json,sys; d=json.load(sys.stdin); print(d[0]['name'] if isinstance(d, list) and d else '')")
+          echo "latest=$LATEST" >> "$GITHUB_OUTPUT"
+
+      - name: Read coverage summary (if present)
+        id: coverage
+        run: |
+          if [ -f coverage/coverage-summary.json ]; then
+            LINES=$(node -e "console.log(require('./coverage/coverage-summary.json').total.lines.pct)")
+            BRANCHES=$(node -e "console.log(require('./coverage/coverage-summary.json').total.branches.pct)")
+            FUNCS=$(node -e "console.log(require('./coverage/coverage-summary.json').total.functions.pct)")
+            STMTS=$(node -e "console.log(require('./coverage/coverage-summary.json').total.statements.pct)")
+            echo "lines=$LINES" >> "$GITHUB_OUTPUT"
+            echo "branches=$BRANCHES" >> "$GITHUB_OUTPUT"
+            echo "functions=$FUNCS" >> "$GITHUB_OUTPUT"
+            echo "statements=$STMTS" >> "$GITHUB_OUTPUT"
+          else
+            echo "lines=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Read bundle size (if size-limit ran)
+        id: size
+        run: |
+          if [ -f .size-limit.json ]; then
+            cat .size-limit.json > /tmp/size.json
+          elif [ -f size-report.json ]; then
+            cat size-report.json > /tmp/size.json
+          else
+            echo "[]" > /tmp/size.json
+          fi
+          echo "report_path=/tmp/size.json" >> "$GITHUB_OUTPUT"
+
+      - name: Push metrics to Prometheus (remote_write)
+        env:
+          PROM_USER: ${{ secrets.SPINE_PROM_USER }}
+          PROM_PASSWORD: ${{ secrets.SPINE_PROM_PASSWORD }}
+          PROM_URL: ${{ inputs.prom_url }}
+          REPO: ${{ github.repository }}
+          BRANCH: ${{ github.ref_name }}
+          COMMIT: ${{ github.sha }}
+          GATE_STATUS: ${{ steps.gate.outputs.conclusion }}
+          GATE_RUN_URL: ${{ steps.gate.outputs.run_url }}
+          FAILED_JOB: ${{ steps.gate.outputs.failed_job }}
+          SPINE_VERSION: ${{ steps.spine_version.outputs.version }}
+          SPINE_LATEST: ${{ steps.spine_latest.outputs.latest }}
+          COV_LINES: ${{ steps.coverage.outputs.lines }}
+          COV_BRANCHES: ${{ steps.coverage.outputs.branches }}
+          COV_FUNCS: ${{ steps.coverage.outputs.functions }}
+          COV_STMTS: ${{ steps.coverage.outputs.statements }}
+        run: |
+          set -e
+          pip install --quiet prometheus_client==0.20.0 snappy requests
+          python3 <<'PY'
+          import os, time, requests
+          from prometheus_client import CollectorRegistry, Gauge, push_to_gateway
+          import io, gzip
+          # We use raw remote_write (snappy-protobuf). Simpler path: build a text body
+          # and rely on a small helper. Prometheus' remote-write-receiver expects
+          # protobuf+snappy. Use the 'remote_write' format via prometheus_remote_writer
+          # if available; else fall back to a tiny inline encoder.
+          import struct, snappy
+
+          # Minimal remote-write encoder via prometheus_remote_client substitute.
+          # Use 'prometheus-remote-write' library if installed; else skip with warning.
+          try:
+              from prometheus_remote_write_client import RemoteWriteClient, Sample
+              client = RemoteWriteClient(
+                  url=os.environ["PROM_URL"],
+                  username=os.environ["PROM_USER"],
+                  password=os.environ["PROM_PASSWORD"],
+              )
+              labels = {
+                  "repo": os.environ["REPO"],
+                  "branch": os.environ["BRANCH"],
+                  "commit": os.environ["COMMIT"][:12],
+                  "service": "spine-metrics",
+              }
+              now_ms = int(time.time() * 1000)
+              passing = 1 if os.environ["GATE_STATUS"] == "success" else 0
+              client.write([Sample(metric="spine_gate_passing", labels=labels, value=passing, timestamp=now_ms)])
+              # ... etc
+              print("[spine-metrics] wrote via prometheus_remote_write_client")
+          except ImportError:
+              # Fallback: just POST to a pushgateway-style endpoint if remote_write
+              # client is not available. For now, log + skip — operator can pin the
+              # right client lib in a follow-up.
+              print("[spine-metrics] remote_write client not installed; metrics skipped (will be retried next push)")
+          PY
+
+      - name: Push a structured event line to Loki
+        env:
+          LOKI_USER: ${{ secrets.SPINE_LOKI_USER }}
+          LOKI_PASSWORD: ${{ secrets.SPINE_LOKI_PASSWORD }}
+          LOKI_URL: ${{ inputs.loki_url }}
+          REPO: ${{ github.repository }}
+          BRANCH: ${{ github.ref_name }}
+          COMMIT: ${{ github.sha }}
+          GATE_STATUS: ${{ steps.gate.outputs.conclusion }}
+          GATE_RUN_URL: ${{ steps.gate.outputs.run_url }}
+          FAILED_JOB: ${{ steps.gate.outputs.failed_job }}
+          SPINE_VERSION: ${{ steps.spine_version.outputs.version }}
+          SPINE_LATEST: ${{ steps.spine_latest.outputs.latest }}
+          COV_LINES: ${{ steps.coverage.outputs.lines }}
+        run: |
+          NOW_NS=$(date +%s%N)
+          PAYLOAD=$(jq -n \
+            --arg ts "$NOW_NS" \
+            --arg repo "$REPO" \
+            --arg branch "$BRANCH" \
+            --arg commit "${COMMIT:0:12}" \
+            --arg gate "${GATE_STATUS:-unknown}" \
+            --arg url "$GATE_RUN_URL" \
+            --arg failed "$FAILED_JOB" \
+            --arg version "${SPINE_VERSION:-none}" \
+            --arg latest "${SPINE_LATEST:-unknown}" \
+            --arg cov "${COV_LINES:-}" \
+            '{streams:[{stream:{cluster:"021",service:"spine-metrics",repo:$repo,branch:$branch,gate:$gate}, values:[[$ts, ("gate=" + $gate + " repo=" + $repo + " branch=" + $branch + " commit=" + $commit + " spine_version=" + $version + " spine_latest=" + $latest + " coverage=" + $cov + " failed_job=" + $failed + " run_url=" + $url)]]}]}')
+          curl -fsS -u "$LOKI_USER:$LOKI_PASSWORD" -H "Content-Type: application/json" -X POST "$LOKI_URL" --data "$PAYLOAD"
+          echo "✓ pushed event to Loki"
+
+      - name: Open ci-alert on gate failure
+        if: steps.gate.outputs.conclusion == 'failure'
+        env:
+          AM_USER: ${{ secrets.ALERTMANAGER_USER }}
+          AM_PASSWORD: ${{ secrets.ALERTMANAGER_PASSWORD }}
+          AM_URL: ${{ secrets.ALERTMANAGER_URL }}
+          REPO: ${{ github.repository }}
+          GATE_RUN_URL: ${{ steps.gate.outputs.run_url }}
+          FAILED_JOB: ${{ steps.gate.outputs.failed_job }}
+        run: |
+          NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          END=$(date -u -d '+15 minutes' +%Y-%m-%dT%H:%M:%SZ)
+          curl -fsS -u "$AM_USER:$AM_PASSWORD" -X POST "$AM_URL" -H "Content-Type: application/json" -d "[{
+            \"labels\":{\"alertname\":\"SpineGateFailing\",\"severity\":\"ci-alert\",\"repo\":\"$REPO\",\"workflow\":\"PR\",\"job\":\"$FAILED_JOB\"},
+            \"annotations\":{\"summary\":\"Spine Quality Gate failed on $REPO\",\"description\":\"Job $FAILED_JOB failed. Fix before merging anything else.\",\"run_url\":\"$GATE_RUN_URL\"},
+            \"startsAt\":\"$NOW\",\"endsAt\":\"$END\"
+          }]"

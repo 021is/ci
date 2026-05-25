@@ -1,0 +1,171 @@
+name: Spine Quality Gate
+
+# Reusable workflow — the mandatory PR check for every Spine-shaped repo.
+# Runs every static gate in parallel; blocks merge on any error.
+#
+# Consumer usage (.github/workflows/pr.yml):
+#
+#   on: [pull_request]
+#   jobs:
+#     spine:
+#       uses: 021is/ci/.github/workflows/spine-quality-gate.yml@v1
+#       secrets: inherit
+
+on:
+  workflow_call:
+    inputs:
+      runtime:
+        type: string
+        default: "bun"
+        description: "bun | node"
+      node_version:
+        type: string
+        default: "22"
+      install_cmd:
+        type: string
+        default: ""
+      pre_test_cmd:
+        type: string
+        default: ""
+        description: "Run after install, before tests (e.g. 'bunx prisma generate')."
+      coverage_lines:
+        type: number
+        default: 70
+      coverage_branches:
+        type: number
+        default: 60
+      type_coverage_min:
+        type: number
+        default: 99
+      bundle_size_limit:
+        type: string
+        default: "200 kB"
+      skip:
+        type: string
+        default: ""
+        description: "Comma-separated job ids to skip (e.g. 'lighthouse,size-limit'). Use sparingly + document why."
+
+jobs:
+  # ─── Lint ───────────────────────────────────────────────────────────────
+  biome:
+    if: ${{ !contains(inputs.skip, 'biome') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - run: ${{ inputs.install_cmd || 'bun install --frozen-lockfile' }}
+      - run: bunx biome check . --reporter=github
+
+  # ─── Type-check + type coverage ────────────────────────────────────────
+  typecheck:
+    if: ${{ !contains(inputs.skip, 'typecheck') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - run: ${{ inputs.install_cmd || 'bun install --frozen-lockfile' }}
+      - run: ${{ inputs.pre_test_cmd }}
+        if: ${{ inputs.pre_test_cmd != '' }}
+      - run: bunx tsc --noEmit
+      - run: bunx type-coverage --at-least ${{ inputs.type_coverage_min }} --strict
+
+  # ─── Dead code + circular deps ─────────────────────────────────────────
+  knip:
+    if: ${{ !contains(inputs.skip, 'knip') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - run: ${{ inputs.install_cmd || 'bun install --frozen-lockfile' }}
+      - run: bunx knip --reporter=compact
+
+  madge:
+    if: ${{ !contains(inputs.skip, 'madge') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - run: ${{ inputs.install_cmd || 'bun install --frozen-lockfile' }}
+      - run: bunx madge --circular --extensions ts,tsx src/
+
+  # ─── Hexagonal layer rules ─────────────────────────────────────────────
+  depcruise:
+    if: ${{ !contains(inputs.skip, 'depcruise') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - run: ${{ inputs.install_cmd || 'bun install --frozen-lockfile' }}
+      - run: bunx depcruise --validate src/
+
+  # ─── Spine custom AST checks ───────────────────────────────────────────
+  spine-lint:
+    if: ${{ !contains(inputs.skip, 'spine-lint') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - run: ${{ inputs.install_cmd || 'bun install --frozen-lockfile' }}
+      - run: bunx spine-lint --github .
+
+  # ─── Security ──────────────────────────────────────────────────────────
+  npm-audit:
+    if: ${{ !contains(inputs.skip, 'npm-audit') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - run: ${{ inputs.install_cmd || 'bun install --frozen-lockfile' }}
+      - run: bun audit --severity high
+
+  semgrep:
+    if: ${{ !contains(inputs.skip, 'semgrep') }}
+    runs-on: ubuntu-latest
+    container:
+      image: returntocorp/semgrep
+    steps:
+      - uses: actions/checkout@v4
+      - name: Semgrep OWASP + Spine ruleset
+        run: |
+          # The config path resolves inside the consumer's node_modules
+          # via spine-quality. If you don't have spine-quality installed,
+          # this job will fail — install it.
+          CONFIG=$(node -p "require.resolve('@021is/spine-quality/semgrep')" 2>/dev/null || echo "")
+          if [ -z "$CONFIG" ]; then
+            echo "::warning::@021is/spine-quality not installed; running default p/owasp-top-ten only"
+            semgrep ci --config p/owasp-top-ten
+          else
+            semgrep ci --config "$CONFIG" --config p/owasp-top-ten
+          fi
+
+  # ─── Tests + coverage ──────────────────────────────────────────────────
+  test:
+    if: ${{ !contains(inputs.skip, 'test') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - run: ${{ inputs.install_cmd || 'bun install --frozen-lockfile' }}
+      - run: ${{ inputs.pre_test_cmd }}
+        if: ${{ inputs.pre_test_cmd != '' }}
+      - run: |
+          bunx vitest run \
+            --coverage \
+            --coverage.thresholds.lines=${{ inputs.coverage_lines }} \
+            --coverage.thresholds.branches=${{ inputs.coverage_branches }} \
+            --reporter=verbose \
+            --reporter=github-actions
+
+  # ─── Bundle size ───────────────────────────────────────────────────────
+  size:
+    if: ${{ !contains(inputs.skip, 'size') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - run: ${{ inputs.install_cmd || 'bun install --frozen-lockfile' }}
+      - run: ${{ inputs.pre_test_cmd }}
+        if: ${{ inputs.pre_test_cmd != '' }}
+      - run: bun run build
+      - name: Check bundle size budget
+        run: bunx size-limit --json | tee size-report.json

@@ -53,7 +53,10 @@ runs:
     - name: Log in to registry
       shell: bash
       run: |
-        echo "${{ inputs.registry-password }}" | docker login "${{ inputs.registry }}" \
+        # Split a "host/path" registry value (e.g. ghcr.io/021is) — docker login needs the host only.
+        REG_HOST="${{ inputs.registry }}"
+        REG_HOST="${REG_HOST%%/*}"
+        echo "${{ inputs.registry-password }}" | docker login "$REG_HOST" \
           --username "${{ inputs.registry-user }}" --password-stdin
 
     - name: Build image

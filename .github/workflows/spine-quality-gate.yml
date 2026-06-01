@@ -51,7 +51,7 @@ jobs:
     if: ${{ !contains(inputs.skip, 'biome') }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: oven-sh/setup-bun@v2
       - run: ${{ inputs.install_cmd || 'bun install --frozen-lockfile' }}
       - run: bunx biome check . --reporter=github
@@ -61,7 +61,7 @@ jobs:
     if: ${{ !contains(inputs.skip, 'typecheck') }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: oven-sh/setup-bun@v2
       - run: ${{ inputs.install_cmd || 'bun install --frozen-lockfile' }}
       - run: ${{ inputs.pre_test_cmd }}
@@ -74,7 +74,7 @@ jobs:
     if: ${{ !contains(inputs.skip, 'knip') }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: oven-sh/setup-bun@v2
       - run: ${{ inputs.install_cmd || 'bun install --frozen-lockfile' }}
       - run: bunx knip --reporter=compact
@@ -83,7 +83,7 @@ jobs:
     if: ${{ !contains(inputs.skip, 'madge') }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: oven-sh/setup-bun@v2
       - run: ${{ inputs.install_cmd || 'bun install --frozen-lockfile' }}
       - run: bunx madge --circular --extensions ts,tsx src/
@@ -93,7 +93,7 @@ jobs:
     if: ${{ !contains(inputs.skip, 'depcruise') }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: oven-sh/setup-bun@v2
       - run: ${{ inputs.install_cmd || 'bun install --frozen-lockfile' }}
       - run: bunx depcruise --validate src/
@@ -103,7 +103,7 @@ jobs:
     if: ${{ !contains(inputs.skip, 'spine-lint') }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: oven-sh/setup-bun@v2
       - run: ${{ inputs.install_cmd || 'bun install --frozen-lockfile' }}
       - run: bunx spine-lint --github .
@@ -113,7 +113,7 @@ jobs:
     if: ${{ !contains(inputs.skip, 'npm-audit') }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: oven-sh/setup-bun@v2
       - run: ${{ inputs.install_cmd || 'bun install --frozen-lockfile' }}
       - run: bun audit --severity high
@@ -124,7 +124,7 @@ jobs:
     container:
       image: returntocorp/semgrep
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Semgrep OWASP + Spine ruleset
         run: |
           # The config path resolves inside the consumer's node_modules
@@ -143,7 +143,7 @@ jobs:
     if: ${{ !contains(inputs.skip, 'test') }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: oven-sh/setup-bun@v2
       - run: ${{ inputs.install_cmd || 'bun install --frozen-lockfile' }}
       - run: ${{ inputs.pre_test_cmd }}
@@ -161,7 +161,7 @@ jobs:
     if: ${{ !contains(inputs.skip, 'size') }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: oven-sh/setup-bun@v2
       - run: ${{ inputs.install_cmd || 'bun install --frozen-lockfile' }}
       - run: ${{ inputs.pre_test_cmd }}

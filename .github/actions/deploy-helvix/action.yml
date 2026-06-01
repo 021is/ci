@@ -1,0 +1,113 @@
+name: Deploy to Helvix
+description: |
+  Build the consumer's Docker image, push it to registry.helvix.eu,
+  and bump the image.tag in 021is/021-infra so Argo CD rolls the tenant
+  pod. Replaces the old rsync-ssh-edvone-web pattern.
+
+inputs:
+  app-name:
+    description: 'Tenant directory under 021is/021-infra/apps/<app-name>/values.yaml. Also the registry repo name.'
+    required: true
+  dockerfile:
+    description: 'Dockerfile path relative to build-context.'
+    required: false
+    default: 'Dockerfile'
+  build-context:
+    description: 'Docker build context.'
+    required: false
+    default: '.'
+  build-args:
+    description: 'Newline-separated KEY=VALUE pairs passed as --build-arg.'
+    required: false
+    default: ''
+  registry-user:
+    description: 'Registry username (HELVIX_REGISTRY_USER).'
+    required: true
+  registry-password:
+    description: 'Registry password (HELVIX_REGISTRY_PASSWORD).'
+    required: true
+  infra-push-token:
+    description: 'PAT with `repo` write access to the infra-repo (INFRA_PUSH_TOKEN).'
+    required: true
+  infra-repo:
+    description: 'Target 021-infra repo (owner/name).'
+    required: false
+    default: '021is/021-infra'
+  registry:
+    description: 'Container registry host.'
+    required: false
+    default: 'registry.helvix.eu'
+
+runs:
+  using: composite
+  steps:
+    - name: Compute tag
+      id: tag
+      shell: bash
+      run: |
+        SHORT="${GITHUB_SHA:0:8}"
+        echo "short=$SHORT"            >> "$GITHUB_OUTPUT"
+        echo "image_tag=sha-$SHORT"    >> "$GITHUB_OUTPUT"
+        echo "image_ref=${{ inputs.registry }}/${{ inputs.app-name }}:sha-$SHORT" >> "$GITHUB_OUTPUT"
+
+    - name: Log in to registry
+      shell: bash
+      run: |
+        echo "${{ inputs.registry-password }}" | docker login "${{ inputs.registry }}" \
+          --username "${{ inputs.registry-user }}" --password-stdin
+
+    - name: Build image
+      shell: bash
+      run: |
+        ARGS=()
+        while IFS= read -r line; do
+          [ -z "$line" ] && continue
+          ARGS+=(--build-arg "$line")
+        done <<< "${{ inputs.build-args }}"
+        docker build \
+          -f "${{ inputs.build-context }}/${{ inputs.dockerfile }}" \
+          -t "${{ steps.tag.outputs.image_ref }}" \
+          -t "${{ inputs.registry }}/${{ inputs.app-name }}:prod" \
+          "${ARGS[@]}" \
+          "${{ inputs.build-context }}"
+
+    - name: Push image
+      shell: bash
+      run: |
+        docker push "${{ steps.tag.outputs.image_ref }}"
+        docker push "${{ inputs.registry }}/${{ inputs.app-name }}:prod"
+
+    - name: Bump tag in 021-infra
+      shell: bash
+      run: |
+        set -e
+        INFRA_DIR="$RUNNER_TEMP/infra-bump"
+        git clone --depth 1 \
+          "https://x-access-token:${{ inputs.infra-push-token }}@github.com/${{ inputs.infra-repo }}.git" \
+          "$INFRA_DIR"
+        cd "$INFRA_DIR"
+        VALUES="apps/${{ inputs.app-name }}/values.yaml"
+        if [ ! -f "$VALUES" ]; then
+          echo "::error::$VALUES not found in ${{ inputs.infra-repo }}"
+          exit 1
+        fi
+        # bump image.tag: line (preserves indent, in-place)
+        sed -i -E "s|^([[:space:]]+tag:[[:space:]]+).+$|\1${{ steps.tag.outputs.image_tag }}|" "$VALUES"
+        if git diff --quiet "$VALUES"; then
+          echo "::notice::No tag change for ${{ inputs.app-name }} (already ${{ steps.tag.outputs.image_tag }})"
+          exit 0
+        fi
+        git -c user.email='ci@helvix' -c user.name='helvix-ci' \
+          commit -m "deploy(${{ inputs.app-name }}): ${{ steps.tag.outputs.image_tag }} [skip ci]" "$VALUES"
+        git push origin HEAD:main
+
+    - name: Summary
+      shell: bash
+      run: |
+        cat <<EOF >> $GITHUB_STEP_SUMMARY
+        ## Deployed to Helvix
+        - **App**: \`${{ inputs.app-name }}\`
+        - **Image**: \`${{ steps.tag.outputs.image_ref }}\`
+        - **Tag bumped in**: \`${{ inputs.infra-repo }}/apps/${{ inputs.app-name }}/values.yaml\`
+        - Argo CD auto-syncs within ~3 min.
+        EOF

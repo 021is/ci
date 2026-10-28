@@ -13,6 +13,9 @@ One source of truth for: deploy patterns, alert wiring, PR gates. Fix a bug here
 | [`ssh-systemd-deploy.yml`](.github/workflows/ssh-systemd-deploy.yml) | Atomic releases-style deploy for Bun/Node apps behind systemd. Builds in `releases/<sha>`, swaps `current` symlink, restarts service, health-checks. |
 | [`cf-worker-deploy.yml`](.github/workflows/cf-worker-deploy.yml) | `wrangler deploy` for Cloudflare Workers (parked, future edge services). |
 | [`pr-check-node.yml`](.github/workflows/pr-check-node.yml) | typecheck + lint + build dry-run for Node/TS repos on PRs. |
+| [`spine-quality-gate.yml`](.github/workflows/spine-quality-gate.yml) | The PR check for Spine-shaped repos: biome, typecheck, knip, madge, depcruise, spine-lint, audit, semgrep, tests and size, in parallel. |
+| [`spine-metrics.yml`](.github/workflows/spine-metrics.yml) | Post-merge: pushes a Spine repo's gate results, coverage, bundle size and Spine version to 021-mon (Prometheus remote-write + Loki). |
+| [`deploy-helvix`](.github/actions/deploy-helvix/action.yml) (composite action) | Builds and pushes the image, then bumps `image.tag` in `021is/021-infra` so Argo CD rolls the pod. |
 
 ## How to use from a consumer repo
 
@@ -59,16 +62,14 @@ Bootstrap a new repo: `gh secret set <NAME> --repo 021is/<repo> --body "$(vault 
 
 ## Versioning
 
-Tag `v1.0.0` etc. Consumers should pin a major: `@v1`. Breaking changes get a new major; existing consumers keep working.
-
-Currently: `@main` accepted during initial rollout. Switch to `@v1` after first stable tag.
+Each release is a `v1.X.Y` tag and a `CHANGELOG.md` entry. Consumers pin the major, `@v1`, a moving tag that follows the latest `v1.X.Y` (`git tag -f v1 v1.X.Y && git push -f origin v1`), or an exact `@v1.X.Y` when they need a change before `v1` moves. Breaking changes get a new major; existing consumers keep working.
 
 ## Adding a new reusable workflow
 
 1. Drop a new `.github/workflows/<name>.yml` with `on: workflow_call:` and explicit `inputs:` + `secrets:`.
 2. If it deploys, end with a `notify` job that calls `notify-failure.yml@main` on `failure()`.
 3. Document the inputs + required secrets in the table above.
-4. Tag a release (`gh release create v1.X.0`).
+4. Add a `CHANGELOG.md` entry, tag `v1.X.0` and move `v1` to it (§ Versioning).
 
 ## Why not... ?
 

@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.1] — 2026-10-28
+
+### Fixed
+
+- `ssh-rsync-deploy.yml` installs rsync when the runner has none. The self-hosted runner image
+  ships without it, so 021-mon's first deploy there stopped at `rsync: command not found` (before
+  copying anything).
+
 ## [1.1.0] — 2026-10-28
 
 ### Added

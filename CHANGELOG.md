@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.0] — 2026-10-28
+
+### Added
+
+- `runs_on` on `ssh-rsync-deploy.yml` and `notify-failure.yml`: the runner as JSON, default
+  `"ubuntu-latest"`, so every existing caller is unchanged. `'["self-hosted","021"]'` runs the job
+  on 021is's own slot on the CI box (danceclub-infra `ci/README.md` § 021is): no billed minutes,
+  and it runs while the org's Actions spending is blocked, as it was on 2026-10-28. The deploy
+  passes it on to its failure notice.
+
 ## [1.0.0] — 2026-05-10
 
 ### Added

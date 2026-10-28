@@ -39,6 +39,8 @@ jobs:
 
 `secrets: inherit` passes all repo-level secrets through. The reusable workflow declares which ones it requires; GitHub enforces presence.
 
+**Where it runs:** GitHub's `ubuntu-latest` unless the caller passes `runs_on` (`ssh-rsync-deploy`, `notify-failure`), as JSON. A private 021is repo passes `runs_on: '["self-hosted","021"]'` to run on the org's own slot on the CI box: no billed minutes, and it runs while the org's Actions spending is blocked (2026-10-28). A public repo keeps GitHub's runners, which are free for it.
+
 ## Required secrets (per consumer repo)
 
 Every consumer that uses a deploy workflow MUST have these set:

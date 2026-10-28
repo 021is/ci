@@ -20,6 +20,11 @@ on:
         type: string
         default: critical
         description: "critical | warning | info"
+      runs_on:
+        required: false
+        type: string
+        default: '"ubuntu-latest"'
+        description: 'The runner, as JSON: "ubuntu-latest" (default) or a self-hosted label list, e.g. ["self-hosted","021"]'
     secrets:
       ALERTMANAGER_URL:
         required: true
@@ -30,7 +35,7 @@ on:
 
 jobs:
   push:
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(inputs.runs_on) }}
     steps:
       - name: Push to Alertmanager
         env:

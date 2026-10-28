@@ -38,6 +38,11 @@ on:
         type: string
         default: root
         description: "SSH user on the remote host"
+      runs_on:
+        required: false
+        type: string
+        default: '"ubuntu-latest"'
+        description: 'The runner, as JSON: "ubuntu-latest" (default, billed minutes) or a self-hosted label list, e.g. ["self-hosted","021"] (the CI box; free, and runs while the org Actions spending is blocked)'
 
     secrets:
       SSH_HOST:
@@ -58,7 +63,7 @@ concurrency:
 jobs:
   deploy:
     name: Deploy ${{ inputs.service }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(inputs.runs_on) }}
     steps:
       - uses: actions/checkout@v5
 
@@ -101,4 +106,5 @@ jobs:
       project: ${{ inputs.service }}
       alertname: ${{ inputs.service }}-deploy-failed
       severity: critical
+      runs_on: ${{ inputs.runs_on }}
     secrets: inherit

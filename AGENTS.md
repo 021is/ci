@@ -26,6 +26,7 @@ That's it. Edit a workflow, commit, tag a release. Consumers pick up the change 
   - `ssh-systemd-deploy.yml` — atomic-symlink Bun/Node deploys behind systemd.
   - `cf-worker-deploy.yml` — wrangler deploy for CF Workers.
   - `pr-check-node.yml` — typecheck + lint + build for PRs on Node/TS repos.
+  - `pr-check-gradle.yml`, `ghcr-compose-deploy.yml` — Kotlin/Gradle PR gate and GHCR image + compose roll; copied from DanceClub-Platform/ci (private, not callable from here), runner label `[self-hosted, "021"]` (private repos only). Re-sync by diff when that repo changes.
 - `README.md` — humans + how to call from a consumer.
 - `CHANGELOG.md` — Keep-a-Changelog with `## [Unreleased]` block; `git tag v*` rolls via `git cliff`.
 

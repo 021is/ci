@@ -1,0 +1,178 @@
+name: PR check (Gradle)
+
+# Reusable workflow — the mandatory PR gate for Kotlin/Gradle repos.
+#
+# ONE job: every task in one Gradle invocation, then gitleaks. On the org's two self-hosted
+# runners (danceclub-infra ci/README.md) a job per task was the expensive shape: five containers,
+# five checkouts, five JDK setups and five compiles of the same sources per PR, and a queue of 60
+# jobs on 2026-10-22. One run compiles once and shares it with every task. `--continue` keeps
+# what the per-task jobs bought: a ktlint failure and a test failure both surface in the same run,
+# the first never masking the rest. The check is `<caller job> / check` (branch protection
+# requires `gradle / check`).
+#
+# Consumer usage (.github/workflows/pr.yml):
+#
+#   on: [pull_request]
+#   jobs:
+#     gradle:
+#       uses: 021is/ci/.github/workflows/pr-check-gradle.yml@main
+#       secrets: inherit
+#
+# ⚠ Runs on the 021is org's own slot on the CI box (`[self-hosted, "021"]`): for PRIVATE 021is
+# repos only. A public repo must never call it, the box should never run a stranger's PR.
+# A repo that resolves DanceClub-Platform's Maven packages needs the secret GPR_TOKEN.
+#
+# ⚠ Deliberately NOT `./gradlew build`: the named tasks only, so a repo drops one it does not
+# have (a repo without binary-compatibility-validator just omits `apiCheck`).
+
+on:
+  workflow_call:
+    inputs:
+      tasks:
+        required: false
+        type: string
+        default: '["ktlintCheck","detekt","test","apiCheck"]'
+        description: >-
+          JSON array of Gradle tasks, run together in one invocation with --continue. Drop any
+          the repo does not define — an undefined task fails the build, it is not skipped.
+      java_version:
+        required: false
+        type: string
+        default: "25"
+        description: "Temurin JDK the build's toolchain compiles and tests with."
+      gradle_java_version:
+        required: false
+        type: string
+        default: "21"
+        description: >-
+          Temurin JDK Gradle itself runs on. Not the toolchain: detekt 1.23 (Kotlin 2.0.21
+          inside) fails to parse a JDK 25 version string ("25.0.4.1") when Gradle runs on 25.
+      gradle_args:
+        required: false
+        type: string
+        default: ""
+        description: "Extra args appended to the Gradle invocation."
+      packages_owner_repo:
+        required: false
+        type: string
+        default: ""
+        description: >-
+          owner/repo whose GitHub Packages Maven registry holds shared artifacts
+          this repo consumes (e.g. DanceClub-Platform/danceclub-platform).
+          Informational only — the build declares the repository; this workflow
+          just supplies GITHUB_ACTOR/GITHUB_TOKEN so it can authenticate.
+
+    secrets:
+      # Optional. GITHUB_TOKEN can read packages published by its OWN repo, but
+      # not by a sibling repo — GitHub Packages Maven has no cross-repo grant for
+      # the ephemeral token. A repo consuming another repo's artifacts must set a
+      # PAT with `read:packages`.
+      GPR_TOKEN:
+        required: false
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: check
+    # The org's own runners (danceclub-infra ci/README.md); `ubuntu-latest` puts it back on GitHub's.
+    runs-on: [self-hosted, "021"]
+
+    env:
+      # Consumers resolve sibling repos' packages with GPR_TOKEN, falling back to
+      # GITHUB_TOKEN (see publish-maven.yml for why the two stay separate).
+      GITHUB_ACTOR: ${{ github.actor }}
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GPR_TOKEN: ${{ secrets.GPR_TOKEN }}
+
+    steps:
+      # Third-party actions are pinned to a full commit SHA, the release in the comment: a tag
+      # can be moved by whoever controls the action's repo, a SHA cannot (tj-actions, 2025).
+      # Dependabot (this repo's .github/dependabot.yml) proposes every bump as a reviewed PR.
+      # The whole history: gitleaks below reads every commit.
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          fetch-depth: 0
+
+      # Two JDKs, as on a dev box: the LAST one listed is JAVA_HOME, which Gradle runs on; the
+      # toolchain one is handed to Gradle through `fromEnv` in the user gradle.properties below
+      # (setup-java exports JAVA_HOME_<major>_<X64|ARM64>; foojay downloads the JDK if that misses).
+      # Scar 2026-10-19: with Gradle itself on JDK 25, detekt died with nothing but "> 25.0.4.1".
+      - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5.7.0
+        with:
+          java-version: |
+            ${{ inputs.java_version }}
+            ${{ inputs.gradle_java_version }}
+          distribution: temurin
+
+      # setup-gradle, not setup-java's `cache: gradle`: it caches the
+      # configuration cache and build cache separately, and on a pull_request it
+      # writes NOTHING back — so a PR can never poison the cache the default
+      # branch reads. That matters here because a stale Gradle cache serving old
+      # bytecode across modules is a known scar in the DanceClub tree. On our own runners the
+      # Gradle caches are local and outlive the job, so restoring them from GitHub is skipped.
+      - uses: gradle/actions/setup-gradle@748248ddd2a24f49513d8f472f81c3a07d4d50e1 # v4.4.4
+        with:
+          cache-disabled: ${{ runner.environment == 'self-hosted' }}
+
+      # The user gradle.properties wins over the project's. The CI box has 8 GB for two runners
+      # side by side (danceclub-infra ci/README.md § Memory): one Gradle JVM per job, with Kotlin
+      # compiled inside it rather than in a Kotlin daemon of its own, and two workers.
+      - name: Hand Gradle the toolchain JDK and the CI box's memory budget
+        run: |
+          {
+            echo "org.gradle.java.installations.fromEnv=JAVA_HOME_${{ inputs.java_version }}_${{ runner.arch }}"
+            echo "org.gradle.jvmargs=-Xmx2g -XX:+HeapDumpOnOutOfMemoryError -Dfile.encoding=UTF-8"
+            echo "org.gradle.workers.max=2"
+            echo "kotlin.compiler.execution.strategy=in-process"
+          } >> ~/.gradle/gradle.properties
+
+      - name: Gradle ${{ join(fromJSON(inputs.tasks), ', ') }}
+        env:
+          TASKS: ${{ join(fromJSON(inputs.tasks), ' ') }}
+        run: |
+          read -ra gradle_tasks <<<"$TASKS"
+          ./gradlew --continue "${gradle_tasks[@]}" ${{ inputs.gradle_args }}
+
+      - name: Upload reports
+        if: failure()
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
+        with:
+          name: reports
+          path: |
+            **/build/reports/tests/
+            **/build/reports/detekt/
+            **/build/reports/ktlint/
+          retention-days: 7
+          if-no-files-found: ignore
+
+      # A secret in any commit of the history fails the check, deleted later or not: a pushed
+      # secret is leaked whatever the tip looks like (AGENTS.md: application-secrets.yaml is one
+      # slip from it). Runs even when Gradle failed, so both answers arrive in one run.
+      #
+      # gitleaks as its checksum-verified release binary, not gitleaks-action: that action needs a
+      # paid licence for organisation repos, and a binary pinned by checksum runs no third-party
+      # action code beside the repo's token. Baseline 2026-10-19: zero findings in the history of
+      # platform, both services, ci and infra. No allowlist: a false positive is rewritten (a
+      # low-entropy test literal), never ignored.
+      - name: gitleaks over the whole history
+        if: success() || failure()
+        env:
+          VERSION: 8.30.1
+          # From the release's own gitleaks_8.30.1_checksums.txt, one per runner architecture.
+          SHA256_X64: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+          SHA256_ARM64: e4a487ee7ccd7d3a7f7ec08657610aa3606637dab924210b3aee62570fb4b080
+        run: |
+          set -euo pipefail
+          case "$RUNNER_ARCH" in
+            X64) ARCH=x64 SHA256=$SHA256_X64 ;;
+            ARM64) ARCH=arm64 SHA256=$SHA256_ARM64 ;;
+            *) echo "no gitleaks pin for $RUNNER_ARCH" >&2; exit 1 ;;
+          esac
+          curl -sSfL --retry 5 --retry-all-errors --retry-delay 5 -o "$RUNNER_TEMP/gitleaks.tgz" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${VERSION}/gitleaks_${VERSION}_linux_${ARCH}.tar.gz"
+          echo "${SHA256}  $RUNNER_TEMP/gitleaks.tgz" | sha256sum -c -
+          tar xzf "$RUNNER_TEMP/gitleaks.tgz" -C "$RUNNER_TEMP" gitleaks
+          "$RUNNER_TEMP/gitleaks" git --redact --no-banner --verbose .

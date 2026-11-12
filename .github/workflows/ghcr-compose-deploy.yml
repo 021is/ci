@@ -1,0 +1,427 @@
+name: GHCR + compose deploy
+
+# Reusable workflow — build a Docker image IN CI, push it to GHCR, then have the
+# target host pull and restart one compose service.
+#
+# ⚠ THE RULE THIS ENFORCES: **the host never builds.** `docker compose up --build`
+# on a production box accumulates BuildKit cache with no GC policy behind it —
+# that is what took dc-prod to 81% disk (34 GB of cache + 88 dangling images).
+# `--no-build` is passed explicitly on the host so a compose file with a `build:`
+# key cannot quietly reintroduce it.
+#
+# ⚠ It also never prunes globally. These hosts are shared (021-apps runs
+# delvix.cloud alongside; dc-prod runs the monolith alongside the services being
+# extracted). `docker system prune` there would take down a neighbour. Image
+# hygiene belongs in the daemon's `builder.gc` policy, once, not in every deploy.
+#
+# ── Gated and fast: `stage` ────────────────────────────────────────────────────
+# Call it twice. `stage: build` runs IN PARALLEL with the checks; `stage: roll`
+# `needs` both, so nothing reaches the host unless every check passed — and the
+# slow image build does not wait for the checks to finish first. Both stages
+# derive the same tag (`sha-<8>`) from the commit, so no output is passed along.
+#
+#   on:
+#     push: { branches: [main] }
+#   jobs:
+#     checks:
+#       uses: 021is/ci/.github/workflows/pr-check-gradle.yml@main
+#       secrets: inherit
+#     image:
+#       uses: 021is/ci/.github/workflows/ghcr-compose-deploy.yml@main
+#       with: { stage: build, service: public-service, remote_path: /home/edvard/danceclub-staging, ... }
+#       secrets: inherit
+#     roll:
+#       needs: [checks, image]
+#       uses: 021is/ci/.github/workflows/ghcr-compose-deploy.yml@main
+#       with: { stage: roll, service: public-service, remote_path: /home/edvard/danceclub-staging,
+#               remote_user: edvard, health_url: http://127.0.0.1:18081/actuator/health, ... }
+#       secrets: inherit
+#
+# `stage: all` (the default) builds and rolls in one call, ungated.
+#
+# ⚠ `@main`, not `@v1` — this repo has no tags yet.
+
+on:
+  workflow_call:
+    inputs:
+      service:
+        required: true
+        type: string
+        description: >-
+          Compose service name on the host. Also the GHCR image name and the
+          concurrency/alert label, unless `image_name` overrides the image.
+      remote_path:
+        required: false
+        type: string
+        default: ""
+        description: >-
+          Directory on the host holding docker-compose.yml and .env (e.g.
+          /opt/danceclub). Needed to roll; a `stage: build` for an image Argo
+          rolls on prod-k3s (studio-service) leaves it out, and the roll job
+          refuses to run without it.
+      stage:
+        required: false
+        type: string
+        default: all
+        description: >-
+          `build` = image only, `roll` = host only (the image for this commit must
+          already exist), `all` = both. See the header for the gated pattern.
+
+      image_name:
+        required: false
+        type: string
+        default: ""
+        description: "GHCR image name. Defaults to `service`."
+      dockerfile:
+        required: false
+        type: string
+        default: Dockerfile
+        description: "Path to the Dockerfile, relative to the repo root."
+      build_context:
+        required: false
+        type: string
+        default: "."
+      build_args:
+        required: false
+        type: string
+        default: ""
+        description: "Newline-separated KEY=VALUE pairs."
+      platforms:
+        required: false
+        type: string
+        default: linux/arm64
+        description: >-
+          Target architecture. Defaults to arm64 because every DanceClub host is a
+          Hetzner `cax` (Ampere): an amd64 image fails there with `exec format error`.
+          Built under QEMU on a hosted x86 runner — cheap here, because the
+          Dockerfiles copy a jar CI already built and run no compiler.
+
+      pre_build_cmd:
+        required: false
+        type: string
+        default: ""
+        description: >-
+          Run in the checkout before `docker build` — e.g. `./gradlew :app:bootJar`.
+          Building the artifact HERE rather than inside the Dockerfile keeps
+          registry credentials out of image layers and off the host entirely.
+      java_version:
+        required: false
+        type: string
+        default: ""
+        description: "Set to e.g. '25' to install a JDK + Gradle cache before `pre_build_cmd`."
+      gradle_java_version:
+        required: false
+        type: string
+        default: "21"
+        description: "Temurin JDK Gradle itself runs on (see pr-check-gradle.yml)."
+
+      tag_var:
+        required: false
+        type: string
+        default: IMAGE_TAG
+        description: >-
+          Variable written to `<remote_path>/.env` and interpolated by the compose
+          file (`image: ghcr.io/<org>/<svc>:${IMAGE_TAG}`). Give each service its
+          own name when several share one compose project.
+      moving_tag:
+        required: false
+        type: string
+        default: prod
+        description: "Second, moving tag pushed alongside `sha-<short>`. Empty to skip."
+
+      remote_user:
+        required: false
+        type: string
+        default: root
+      health_url:
+        required: false
+        type: string
+        default: ""
+        description: >-
+          Polled ON THE HOST after restart, so it reports on the container that
+          was just rolled rather than on whatever the public hostname resolves to.
+          Empty skips the check — say why in the consumer if you do.
+      health_timeout:
+        required: false
+        type: number
+        default: 300
+        description: >-
+          Seconds. A Spring Boot service running Flyway on boot needs minutes,
+          not seconds, before it binds a port.
+      npm_token:
+        required: false
+        type: boolean
+        default: false
+        description: >-
+          Hand the Dockerfile `GPR_TOKEN` as the build secret `npm_token`
+          (`RUN --mount=type=secret,id=npm_token`), for an `npm ci` that reads
+          @danceclub-platform's packages. A secret, never a build arg: no layer
+          and no image history keeps it.
+
+    # ⚠ ALERTMANAGER_URL / _USER / _PASSWORD were declared here as `required: true`
+    # for a `notify` job that has been removed (see the note at the foot of this
+    # file). Leaving them declared would keep the failure that deletion fixes: GitHub
+    # validates a called workflow's required secrets while building the run graph, so
+    # a required secret nobody supplies kills the whole run at startup — no jobs, no
+    # log, no annotation.
+    secrets:
+      # Needed to roll only (a `stage: build` caller has no host); the roll job
+      # refuses to run without them.
+      SSH_HOST:
+        required: false
+      SSH_KEY:
+        required: false
+      GPR_TOKEN:
+        required: false
+        description: "PAT with `read:packages` when `pre_build_cmd` or the Dockerfile (`npm_token`) resolves artifacts from a SIBLING repo's registry."
+
+# Per stage: the `build` and `roll` calls of one run must not cancel each other,
+# while a newer push still cancels an older run's build or roll.
+concurrency:
+  group: ${{ inputs.service }}-deploy-${{ inputs.stage }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build ${{ inputs.service }}
+    if: inputs.stage != 'roll'
+    # The org's own runners (danceclub-infra ci/README.md), ARM like the hosts: the image builds
+    # natively there, under QEMU on GitHub's x86 ones. `ubuntu-latest` puts it back on GitHub's.
+    runs-on: [self-hosted, "021"]
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+      tag: ${{ steps.meta.outputs.tag }}
+
+    steps:
+      # Pinned by commit SHA (see pr-check-gradle.yml); Dependabot proposes bumps.
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      - name: Image coordinates
+        id: meta
+        run: |
+          set -euo pipefail
+          NAME="${{ inputs.image_name }}"
+          [ -z "$NAME" ] && NAME="${{ inputs.service }}"
+          OWNER=$(echo "${GITHUB_REPOSITORY%%/*}" | tr '[:upper:]' '[:lower:]')
+          {
+            echo "image=ghcr.io/${OWNER}/${NAME}"
+            echo "tag=sha-${GITHUB_SHA:0:8}"
+          } >> "$GITHUB_OUTPUT"
+
+      # Two JDKs: the last is JAVA_HOME (Gradle's), the first the toolchain (see pr-check-gradle.yml).
+      - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5.7.0
+        if: inputs.java_version != ''
+        with:
+          java-version: |
+            ${{ inputs.java_version }}
+            ${{ inputs.gradle_java_version }}
+          distribution: temurin
+
+      - uses: gradle/actions/setup-gradle@748248ddd2a24f49513d8f472f81c3a07d4d50e1 # v4.4.4
+        if: inputs.java_version != ''
+        with:
+          cache-disabled: ${{ runner.environment == 'self-hosted' }}
+
+      - name: Hand Gradle the toolchain JDK
+        if: inputs.java_version != ''
+        run: echo "org.gradle.java.installations.fromEnv=JAVA_HOME_${{ inputs.java_version }}_${{ runner.arch }}" >> ~/.gradle/gradle.properties
+
+      - name: Pre-build
+        if: inputs.pre_build_cmd != ''
+        env:
+          GITHUB_ACTOR: ${{ github.actor }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GPR_TOKEN: ${{ secrets.GPR_TOKEN }}
+        run: ${{ inputs.pre_build_cmd }}
+
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
+
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: ${{ inputs.build_context }}
+          file: ${{ inputs.dockerfile }}
+          build-args: ${{ inputs.build_args }}
+          # Only when asked (`npm_token`); empty otherwise, as before.
+          secrets: ${{ inputs.npm_token && format('npm_token={0}', secrets.GPR_TOKEN) || '' }}
+          platforms: ${{ inputs.platforms }}
+          push: true
+          tags: |
+            ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}
+            ${{ inputs.moving_tag != '' && format('{0}:{1}', steps.meta.outputs.image, inputs.moving_tag) || '' }}
+          # Layer cache lives in GitHub Actions cache, not on the target host.
+          # That is the whole point: the host holds pulled images and nothing else.
+          cache-from: type=gha,scope=${{ inputs.service }}
+          cache-to: type=gha,mode=max,scope=${{ inputs.service }}
+
+      # The image that would roll, scanned before it may: any HIGH or CRITICAL vulnerability that
+      # HAS a fix fails this job, so `deploy` (needs: build) never runs. Fixable only: an unfixed
+      # CVE is not actionable here and would block every deploy for nothing; a fixable one is a
+      # version bump away, and that bump is the work. The image is already pushed when this runs
+      # (a multi-platform build cannot be scanned before its push); it is never rolled.
+      #
+      # Trivy as its checksum-verified release binary, pinned to a release at least two weeks old
+      # when chosen, so no third-party action code runs beside the registry token.
+      #
+      # Measured 2026-10-19: public-service's Spring Boot 3.4.1 image carried 46 fixable
+      # HIGH/CRITICAL (6 CRITICAL in Tomcat 10.1.34), and this gate held every deploy until the
+      # stack moved. On Boot 4.1.1 / Kotlin 2.4.20 / Java 25, with Tomcat, Jackson 3 and Jackson 2
+      # pinned above the BOM and `apk upgrade` in the image, both services scan at 0.
+      - name: Scan the image (Trivy)
+        env:
+          VERSION: 0.75.0
+          # From the release's own trivy_0.75.0_checksums.txt, one per runner architecture.
+          SHA256_X64: c6e65abddb348e25f10549df887045629cf28cc72453cd1c63acb717316b3f3f
+          SHA256_ARM64: a1ee9f6ffb7d112b64ff726a2a0717c21175c1114361391f4a132956751a13b3
+          IMAGE: ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}
+          PLATFORMS: ${{ inputs.platforms }}
+          TRIVY_USERNAME: ${{ github.actor }}
+          TRIVY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          case "$RUNNER_ARCH" in
+            X64) ARCH=64bit SHA256=$SHA256_X64 ;;
+            ARM64) ARCH=ARM64 SHA256=$SHA256_ARM64 ;;
+            *) echo "no trivy pin for $RUNNER_ARCH" >&2; exit 1 ;;
+          esac
+          curl -sSfL -o "$RUNNER_TEMP/trivy.tgz" \
+            "https://github.com/aquasecurity/trivy/releases/download/v${VERSION}/trivy_${VERSION}_Linux-${ARCH}.tar.gz"
+          echo "${SHA256}  $RUNNER_TEMP/trivy.tgz" | sha256sum -c -
+          tar xzf "$RUNNER_TEMP/trivy.tgz" -C "$RUNNER_TEMP" trivy
+          # The first target platform: the one the hosts run (arm64), whatever the runner is.
+          "$RUNNER_TEMP/trivy" image --platform "${PLATFORMS%%,*}" \
+            --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 --no-progress "$IMAGE"
+
+  deploy:
+    name: Roll ${{ inputs.service }}
+    needs: build
+    # With `stage: roll` the build job is skipped on purpose — run anyway. The
+    # gate on the checks lives in the CALLER (`needs: [checks, image]`).
+    if: >-
+      !cancelled() && inputs.stage != 'build' &&
+      (inputs.stage == 'roll' || needs.build.result == 'success')
+    runs-on: [self-hosted, "021"]
+    permissions:
+      contents: read
+      packages: read
+
+    steps:
+      # The host's path and SSH secrets became optional for build-only callers;
+      # a roll without them is a mistake, said here rather than as a bare ssh error.
+      - name: A host to roll on
+        env:
+          SSH_KEY: ${{ secrets.SSH_KEY }}
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          REMOTE_PATH: ${{ inputs.remote_path }}
+        run: |
+          if [ -z "$REMOTE_PATH" ] || [ -z "$SSH_HOST" ] || [ -z "$SSH_KEY" ]; then
+            echo "::error::Rolling needs remote_path and the SSH_HOST / SSH_KEY secrets; a build-only caller sets stage: build."
+            exit 1
+          fi
+      - name: Configure SSH
+        env:
+          SSH_KEY: ${{ secrets.SSH_KEY }}
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H "$SSH_HOST" >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Pull and restart
+        env:
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          USER: ${{ inputs.remote_user }}
+          # The host is NOT given a stored registry credential. This token is
+          # scoped to this run and revoked when it ends, and `docker logout`
+          # removes it from ~/.docker/config.json before we disconnect.
+          REG_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REG_USER: ${{ github.actor }}
+        run: |
+          set -euo pipefail
+          # Everything — values included — travels on stdin. Passing the registry
+          # token as an ssh command argument would put it in the host's process
+          # list, and these hosts are shared.
+          {
+            printf 'REG_USER=%q\n'     "$REG_USER"
+            printf 'REG_TOKEN=%q\n'    "$REG_TOKEN"
+            printf 'REMOTE_PATH=%q\n'  '${{ inputs.remote_path }}'
+            printf 'SERVICE=%q\n'      '${{ inputs.service }}'
+            printf 'TAG_VAR=%q\n'      '${{ inputs.tag_var }}'
+            # Same derivation as the build job's `Image coordinates` — the build
+            # job may not have run in this call (`stage: roll`).
+            printf 'TAG=%q\n'          "sha-${GITHUB_SHA:0:8}"
+            cat <<'REMOTE'
+          cd "$REMOTE_PATH"
+
+          # Pin the exact image this run built. The moving tag exists for humans
+          # reading `docker ps`; the deploy itself is always by digest-stable sha
+          # tag, so a rollback is "set this line to an older sha, re-up".
+          touch .env
+          if grep -q "^${TAG_VAR}=" .env; then
+            sed -i "s|^${TAG_VAR}=.*|${TAG_VAR}=${TAG}|" .env
+          else
+            printf '%s=%s\n' "$TAG_VAR" "$TAG" >> .env
+          fi
+
+          echo "$REG_TOKEN" | docker login ghcr.io -u "$REG_USER" --password-stdin
+          trap 'docker logout ghcr.io >/dev/null 2>&1 || true' EXIT
+
+          docker compose pull "$SERVICE"
+          # --no-build: the host must never build (see header).
+          # --no-deps: a service deploy never restarts the database or broker
+          #            underneath itself.
+          docker compose up -d --no-build --no-deps "$SERVICE"
+          REMOTE
+          } | ssh "${USER}@${SSH_HOST}" 'bash -euo pipefail -s'
+
+      - name: Health check
+        if: inputs.health_url != ''
+        env:
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          USER: ${{ inputs.remote_user }}
+        run: |
+          set -euo pipefail
+          {
+            printf 'REMOTE_PATH=%q\n' '${{ inputs.remote_path }}'
+            printf 'SERVICE=%q\n'     '${{ inputs.service }}'
+            printf 'HEALTH_URL=%q\n'  '${{ inputs.health_url }}'
+            printf 'TIMEOUT=%q\n'     '${{ inputs.health_timeout }}'
+            cat <<'REMOTE'
+          echo "Polling $HEALTH_URL for up to ${TIMEOUT}s..."
+          DEADLINE=$(( $(date +%s) + TIMEOUT ))
+          while [ "$(date +%s)" -lt "$DEADLINE" ]; do
+            if curl -sf --max-time 5 "$HEALTH_URL" >/dev/null 2>&1; then
+              echo "✅ healthy"
+              curl -s --max-time 5 "$HEALTH_URL"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "❌ not healthy after ${TIMEOUT}s. Last 60 log lines:"
+          cd "$REMOTE_PATH" && docker compose logs --tail=60 "$SERVICE"
+          exit 1
+          REMOTE
+          } | ssh "${USER}@${SSH_HOST}" 'bash -euo pipefail -s'
+
+      - name: Summary
+        if: success()
+        run: |
+          {
+            echo "## Rolled \`${{ inputs.service }}\`"
+            echo
+            echo "- image tag: \`sha-${GITHUB_SHA:0:8}\`"
+            echo "- host path: \`${{ inputs.remote_path }}\`"
+            echo "- rollback: set \`${{ inputs.tag_var }}=sha-<older>\` in \`${{ inputs.remote_path }}/.env\`, then \`docker compose up -d --no-build --no-deps ${{ inputs.service }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+

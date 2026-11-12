@@ -4,14 +4,13 @@ name: GHCR + compose deploy
 # target host pull and restart one compose service.
 #
 # ⚠ THE RULE THIS ENFORCES: **the host never builds.** `docker compose up --build`
-# on a production box accumulates BuildKit cache with no GC policy behind it —
-# that is what took dc-prod to 81% disk (34 GB of cache + 88 dangling images).
+# on a production box accumulates BuildKit cache with no GC policy behind it,
+# until the disk fills.
 # `--no-build` is passed explicitly on the host so a compose file with a `build:`
 # key cannot quietly reintroduce it.
 #
-# ⚠ It also never prunes globally. These hosts are shared (021-apps runs
-# delvix.cloud alongside; dc-prod runs the monolith alongside the services being
-# extracted). `docker system prune` there would take down a neighbour. Image
+# ⚠ It also never prunes globally. Target hosts are shared with other
+# stacks. `docker system prune` there would take down a neighbour. Image
 # hygiene belongs in the daemon's `builder.gc` policy, once, not in every deploy.
 #
 # ── Gated and fast: `stage` ────────────────────────────────────────────────────
@@ -28,13 +27,13 @@ name: GHCR + compose deploy
 #       secrets: inherit
 #     image:
 #       uses: 021is/ci/.github/workflows/ghcr-compose-deploy.yml@main
-#       with: { stage: build, service: public-service, remote_path: /home/edvard/danceclub-staging, ... }
+#       with: { stage: build, service: my-service, remote_path: /srv/stack, ... }
 #       secrets: inherit
 #     roll:
 #       needs: [checks, image]
 #       uses: 021is/ci/.github/workflows/ghcr-compose-deploy.yml@main
-#       with: { stage: roll, service: public-service, remote_path: /home/edvard/danceclub-staging,
-#               remote_user: edvard, health_url: http://127.0.0.1:18081/actuator/health, ... }
+#       with: { stage: roll, service: my-service, remote_path: /srv/stack,
+#               remote_user: deploy, health_url: http://127.0.0.1:8080/actuator/health, ... }
 #       secrets: inherit
 #
 # `stage: all` (the default) builds and rolls in one call, ungated.
@@ -56,8 +55,8 @@ on:
         default: ""
         description: >-
           Directory on the host holding docker-compose.yml and .env (e.g.
-          /opt/danceclub). Needed to roll; a `stage: build` for an image Argo
-          rolls on prod-k3s (studio-service) leaves it out, and the roll job
+          /srv/stack). Needed to roll; a `stage: build` for an image another
+          system rolls leaves it out, and the roll job
           refuses to run without it.
       stage:
         required: false
@@ -91,8 +90,8 @@ on:
         type: string
         default: linux/arm64
         description: >-
-          Target architecture. Defaults to arm64 because every DanceClub host is a
-          Hetzner `cax` (Ampere): an amd64 image fails there with `exec format error`.
+          Target architecture. Defaults to arm64 because the target hosts are
+          ARM (Ampere): an amd64 image fails there with `exec format error`.
           Built under QEMU on a hosted x86 runner — cheap here, because the
           Dockerfiles copy a jar CI already built and run no compiler.
 
@@ -185,7 +184,7 @@ jobs:
   build:
     name: Build ${{ inputs.service }}
     if: inputs.stage != 'roll'
-    # The org's own runners (danceclub-infra ci/README.md), ARM like the hosts: the image builds
+    # The org's own runner slot, ARM like the hosts: the image builds
     # natively there, under QEMU on GitHub's x86 ones. `ubuntu-latest` puts it back on GitHub's.
     runs-on: [self-hosted, "021"]
     permissions:
@@ -273,10 +272,6 @@ jobs:
       # Trivy as its checksum-verified release binary, pinned to a release at least two weeks old
       # when chosen, so no third-party action code runs beside the registry token.
       #
-      # Measured 2026-10-19: public-service's Spring Boot 3.4.1 image carried 46 fixable
-      # HIGH/CRITICAL (6 CRITICAL in Tomcat 10.1.34), and this gate held every deploy until the
-      # stack moved. On Boot 4.1.1 / Kotlin 2.4.20 / Java 25, with Tomcat, Jackson 3 and Jackson 2
-      # pinned above the BOM and `apk upgrade` in the image, both services scan at 0.
       - name: Scan the image (Trivy)
         env:
           VERSION: 0.75.0

@@ -38,7 +38,7 @@ name: GHCR + compose deploy
 #
 # `stage: all` (the default) builds and rolls in one call, ungated.
 #
-# ⚠ `@main`, not `@v1` — this repo has no tags yet.
+# ⚠ `@main` until the release tag that carries this workflow exists (v1.2.0); pin that tag then.
 
 on:
   workflow_call:
@@ -157,12 +157,10 @@ on:
           @danceclub-platform's packages. A secret, never a build arg: no layer
           and no image history keeps it.
 
-    # ⚠ ALERTMANAGER_URL / _USER / _PASSWORD were declared here as `required: true`
-    # for a `notify` job that has been removed (see the note at the foot of this
-    # file). Leaving them declared would keep the failure that deletion fixes: GitHub
-    # validates a called workflow's required secrets while building the run graph, so
-    # a required secret nobody supplies kills the whole run at startup — no jobs, no
-    # log, no annotation.
+    # ⚠ Do not declare a secret `required: true` unless every caller always supplies it:
+    # GitHub validates a called workflow's required secrets while building the run graph, so
+    # a required secret nobody supplies kills the whole run at startup — no jobs, no log,
+    # no annotation.
     secrets:
       # Needed to roll only (a `stage: build` caller has no host); the roll job
       # refuses to run without them.
@@ -195,6 +193,12 @@ jobs:
       tag: ${{ steps.meta.outputs.tag }}
 
     steps:
+      - name: Check stage
+        env:
+          STAGE: ${{ inputs.stage }}
+        run: |
+          case "$STAGE" in build | roll | all) ;; *) echo "::error::stage must be build, roll or all, got '$STAGE'"; exit 1 ;; esac
+
       # Pinned by commit SHA (see pr-check-gradle.yml); Dependabot proposes bumps.
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
@@ -226,7 +230,10 @@ jobs:
 
       - name: Hand Gradle the toolchain JDK
         if: inputs.java_version != ''
-        run: echo "org.gradle.java.installations.fromEnv=JAVA_HOME_${{ inputs.java_version }}_${{ runner.arch }}" >> ~/.gradle/gradle.properties
+        # `>` not `>>`: rewritten whole each run, never grown on a reused home.
+        run: |
+          mkdir -p ~/.gradle
+          echo "org.gradle.java.installations.fromEnv=JAVA_HOME_${{ inputs.java_version }}_${{ runner.arch }}" > ~/.gradle/gradle.properties
 
       - name: Pre-build
         if: inputs.pre_build_cmd != ''
@@ -255,9 +262,8 @@ jobs:
           secrets: ${{ inputs.npm_token && format('npm_token={0}', secrets.GPR_TOKEN) || '' }}
           platforms: ${{ inputs.platforms }}
           push: true
-          tags: |
-            ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}
-            ${{ inputs.moving_tag != '' && format('{0}:{1}', steps.meta.outputs.image, inputs.moving_tag) || '' }}
+          # The sha tag only: the moving tag is pushed after the scan passes (step below).
+          tags: ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}
           # Layer cache lives in GitHub Actions cache, not on the target host.
           # That is the whole point: the host holds pulled images and nothing else.
           cache-from: type=gha,scope=${{ inputs.service }}
@@ -297,6 +303,16 @@ jobs:
           "$RUNNER_TEMP/trivy" image --platform "${PLATFORMS%%,*}" \
             --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 --no-progress "$IMAGE"
 
+      # The moving tag (`prod`, `staging`, ...) points at an image only once it has passed the
+      # scan: a registry-side retag of the scanned manifest, no rebuild, no second upload.
+      - name: Move the tag
+        if: inputs.moving_tag != ''
+        env:
+          IMAGE: ${{ steps.meta.outputs.image }}
+          TAG: ${{ steps.meta.outputs.tag }}
+          MOVING_TAG: ${{ inputs.moving_tag }}
+        run: docker buildx imagetools create --tag "${IMAGE}:${MOVING_TAG}" "${IMAGE}:${TAG}"
+
   deploy:
     name: Roll ${{ inputs.service }}
     needs: build
@@ -311,6 +327,11 @@ jobs:
       packages: read
 
     steps:
+      - name: Check stage
+        env:
+          STAGE: ${{ inputs.stage }}
+        run: |
+          case "$STAGE" in build | roll | all) ;; *) echo "::error::stage must be build, roll or all, got '$STAGE'"; exit 1 ;; esac
       # The host's path and SSH secrets became optional for build-only callers;
       # a roll without them is a mistake, said here rather than as a bare ssh error.
       - name: A host to roll on

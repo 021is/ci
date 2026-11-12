@@ -122,12 +122,14 @@ jobs:
       # compiled inside it rather than in a Kotlin daemon of its own, and two workers.
       - name: Hand Gradle the toolchain JDK and the CI box's memory budget
         run: |
+          # `>` not `>>`: the file is rewritten whole each run, never grown on a reused home.
+          mkdir -p ~/.gradle
           {
             echo "org.gradle.java.installations.fromEnv=JAVA_HOME_${{ inputs.java_version }}_${{ runner.arch }}"
             echo "org.gradle.jvmargs=-Xmx2g -XX:+HeapDumpOnOutOfMemoryError -Dfile.encoding=UTF-8"
             echo "org.gradle.workers.max=2"
             echo "kotlin.compiler.execution.strategy=in-process"
-          } >> ~/.gradle/gradle.properties
+          } > ~/.gradle/gradle.properties
 
       - name: Gradle ${{ join(fromJSON(inputs.tasks), ', ') }}
         env:

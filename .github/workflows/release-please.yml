@@ -35,9 +35,9 @@ name: Release (release-please)
 # publish cannot be missed or run twice. Keep it that way; nothing listens on `push: tags`.
 #
 # ⚠ The CALLER grants `contents: write` + `pull-requests: write`: a called workflow's token can
-# never exceed its caller's. And the repo must allow Actions to open pull requests (Settings →
-# Actions → General → "Allow GitHub Actions to create and approve pull requests"), or
-# release-please fails on its first PR.
+# never exceed its caller's. The release PR is opened with the app's token (below), so the repo's
+# "Allow GitHub Actions to create and approve pull requests" setting stays off: it governs
+# GITHUB_TOKEN only, and turning it on would only widen that token.
 #
 # ⚠ release-please acts as a GitHub App, never as GITHUB_TOKEN. A release PR pushed with
 # GITHUB_TOKEN starts no workflow (GitHub's rule against recursive runs), so its check never runs

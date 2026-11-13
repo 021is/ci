@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `release-please.yml`: versions a repo from its conventional commits and tags `v<version>` when
+  its release PR is merged, acting as a GitHub App (`RELEASE_APP_CLIENT_ID`,
+  `RELEASE_APP_PRIVATE_KEY`). Copied from DanceClub-Platform/ci, whose private workflow a 021is
+  repo cannot call: places' release workflow failed on every push before a job started.
+
 ## [1.1.1] — 2026-10-28
 
 ### Fixed

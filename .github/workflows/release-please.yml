@@ -1,0 +1,110 @@
+name: Release (release-please)
+
+# Reusable workflow — versions a repo from its conventional commits. Copied from
+# DanceClub-Platform/ci (private, not callable from here); re-sync by diff when that one changes.
+#
+# On every push to `main`, release-please reads the commits since the last release and keeps ONE
+# open release pull request up to date: the next version in `version.txt` and the new
+# `CHANGELOG.md` section. Merging that PR is the release decision, made by a person; on the push
+# that merge produces, this job tags `v<version>`, creates the GitHub release, and reports
+# `release_created`, which the caller uses to publish.
+#
+#   feat:  minor    fix: perf:  patch    feat!: / BREAKING CHANGE:  minor while 0.x
+#   build: ci: chore: docs: refactor: style: test:  no release on their own
+#
+# Consumer usage (.github/workflows/release.yml), a publish chained in the SAME run:
+#
+#   on:
+#     push: { branches: [main] }
+#   jobs:
+#     release:
+#       permissions: { contents: write, pull-requests: write }
+#       uses: 021is/ci/.github/workflows/release-please.yml@main
+#       secrets:
+#         RELEASE_APP_CLIENT_ID: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+#         RELEASE_APP_PRIVATE_KEY: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+#     publish:
+#       needs: release
+#       if: needs.release.outputs.release_created == 'true'
+#       permissions: { contents: read, packages: write }
+#       uses: ./.github/workflows/publish.yml
+#       with: { version: "${{ needs.release.outputs.version }}" }
+#       secrets: inherit
+#
+# ⚠ A publish is chained here, never triggered by the tag: one run tags and publishes, so a
+# publish cannot be missed or run twice. Keep it that way; nothing listens on `push: tags`.
+#
+# ⚠ The CALLER grants `contents: write` + `pull-requests: write`: a called workflow's token can
+# never exceed its caller's. And the repo must allow Actions to open pull requests (Settings →
+# Actions → General → "Allow GitHub Actions to create and approve pull requests"), or
+# release-please fails on its first PR.
+#
+# ⚠ release-please acts as a GitHub App, never as GITHUB_TOKEN. A release PR pushed with
+# GITHUB_TOKEN starts no workflow (GitHub's rule against recursive runs), so its check never runs
+# and a release could be merged on nothing; the app's installation token starts workflows like a
+# person does. The caller passes `RELEASE_APP_CLIENT_ID` (the app's Client ID, `Iv23…`) and
+# `RELEASE_APP_PRIVATE_KEY` (its private key); both are required, so a repo without them fails
+# here, loudly, instead of falling back to the token that cannot start a check.
+#
+# Config lives in the consumer: `release-please-config.json` + `.release-please-manifest.json`.
+
+on:
+  workflow_call:
+    secrets:
+      RELEASE_APP_CLIENT_ID:
+        description: "The release GitHub App's Client ID (Iv23...)."
+        required: true
+      RELEASE_APP_PRIVATE_KEY:
+        description: "The release GitHub App's private key (PEM)."
+        required: true
+    outputs:
+      release_created:
+        description: "'true' when this run tagged a release."
+        value: ${{ jobs.release.outputs.release_created }}
+      version:
+        description: "The released version, without the leading v (e.g. 0.10.0)."
+        value: ${{ jobs.release.outputs.version }}
+      tag_name:
+        description: "The tag created (e.g. v0.10.0)."
+        value: ${{ jobs.release.outputs.tag_name }}
+      paths_released:
+        description: >-
+          The package paths this run released, as a JSON array (e.g.
+          ["packages/studio-looks"]): for a repo whose published package is not
+          its root, where the three above stay empty. Read its version from the
+          tagged package.json.
+        value: ${{ jobs.release.outputs.paths_released }}
+
+concurrency:
+  group: release-please-${{ github.repository }}
+  cancel-in-progress: false # never interrupt a run that may be tagging
+
+jobs:
+  release:
+    name: Release PR / tag
+    # The org's own runner slot (private repos only); `ubuntu-latest` puts it back on GitHub's.
+    runs-on: [self-hosted, "021"]
+    permissions:
+      contents: write
+      pull-requests: write
+    outputs:
+      release_created: ${{ steps.rp.outputs.release_created }}
+      version: ${{ steps.rp.outputs.version }}
+      tag_name: ${{ steps.rp.outputs.tag_name }}
+      paths_released: ${{ steps.rp.outputs.paths_released || '[]' }}
+    steps:
+      # Pinned by commit SHA (see pr-check-gradle.yml). A token for this repo only, with only what
+      # release-please writes, revoked when the job ends.
+      - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        id: app
+        with:
+          client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+      - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
+        id: rp
+        with:
+          token: ${{ steps.app.outputs.token }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json

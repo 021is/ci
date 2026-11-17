@@ -1,0 +1,23 @@
+name: Check
+
+# This repo's own PR check, not a reusable workflow: check-repo.yml from this very commit (every
+# workflow and action parses, gitleaks over the tree and history). main's ruleset requires
+# `repo / check`. No paths filter: a required check that never starts blocks a PR forever.
+# GitHub's runners: this repo is public, and 021's own runners take private repos only.
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  repo:
+    uses: ./.github/workflows/check-repo.yml
+    with:
+      runs_on: '["ubuntu-latest"]'

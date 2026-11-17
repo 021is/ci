@@ -7,7 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `deploy-helvix`: the 021-infra bump is a PR that merges itself once 021-infra's checks pass,
+  and the step waits for the merge (15 minutes at most), since 021-infra's main takes only PRs.
+  Its commit drops `[skip ci]`, which would skip those checks.
+
 ### Added
+
+- `check-repo.yml`: the PR check floor for repos with no build of their own (every YAML and JSON
+  file parses, every shell script passes `bash -n`, gitleaks over the tree and history), as
+  `<caller job> / check`. `self-check.yml` runs it on this repo's own PRs.
 
 - `check-go.yml`: the gate for a Go module, in two jobs at once (`check`: build, vet,
   golangci-lint with 021is/code-rules' shared config at `code_rules_ref`, go-rules, govulncheck,

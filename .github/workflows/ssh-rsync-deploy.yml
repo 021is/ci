@@ -67,15 +67,21 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      # The key and the host's key live in this job's own temp folder, never in the runner's
+      # ~/.ssh: a persistent runner keeps nothing of a job (removed again in the last step).
       - name: Configure SSH
         env:
           SSH_KEY: ${{ secrets.SSH_KEY }}
           SSH_HOST: ${{ secrets.SSH_HOST }}
         run: |
-          install -m 700 -d ~/.ssh
-          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_ed25519
-          chmod 600 ~/.ssh/id_ed25519
-          ssh-keyscan -H "$SSH_HOST" >> ~/.ssh/known_hosts 2>/dev/null
+          set -euo pipefail
+          dir="$RUNNER_TEMP/ssh"
+          install -m 700 -d "$dir"
+          printf '%s\n' "$SSH_KEY" > "$dir/id_ed25519"
+          chmod 600 "$dir/id_ed25519"
+          ssh-keyscan -H "$SSH_HOST" > "$dir/known_hosts" 2>/dev/null
+          printf 'Host *\n  IdentityFile %s/id_ed25519\n  IdentitiesOnly yes\n  UserKnownHostsFile %s/known_hosts\n  StrictHostKeyChecking yes\n' "$dir" "$dir" > "$dir/config"
+          echo "SSH_CONFIG=$dir/config" >> "$GITHUB_ENV"
 
       # GitHub's runners ship rsync; the self-hosted runner image does not, and 021-mon's first
       # deploy on it failed at "rsync: command not found" (2026-10-28).
@@ -94,7 +100,7 @@ jobs:
           while IFS= read -r pat; do
             [ -n "$pat" ] && excludes="$excludes --exclude=$pat"
           done <<< "${{ inputs.rsync_excludes }}"
-          rsync -azv $excludes ${{ inputs.rsync_paths }} "${USER}@${SSH_HOST}:${{ inputs.remote_path }}"
+          rsync -azv -e "ssh -F $SSH_CONFIG" $excludes ${{ inputs.rsync_paths }} "${USER}@${SSH_HOST}:${{ inputs.remote_path }}"
 
       - name: Post-deploy commands
         if: inputs.post_deploy != ''
@@ -102,7 +108,12 @@ jobs:
           SSH_HOST: ${{ secrets.SSH_HOST }}
           USER: ${{ inputs.remote_user }}
         run: |
-          ssh "${USER}@${SSH_HOST}" 'set -eu; ${{ inputs.post_deploy }}'
+          ssh -F "$SSH_CONFIG" "${USER}@${SSH_HOST}" 'set -eu; ${{ inputs.post_deploy }}'
+
+      # Whatever happened above, the key leaves the runner with the job.
+      - name: Remove the SSH key
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/ssh"
 
   notify:
     name: Notify on failure

@@ -1,5 +1,8 @@
 # AGENT.md — 021/ci
 
+Coding rules: 021is/code-rules v0.6.0 (PRINCIPLES; workflows only, no language file), then
+§ Conventions below.
+
 > **If you touched this project, update this file before you commit.**
 > The next agent loads it on boot to continue from where you left off.
 > One or two lines per entry — never essays.
@@ -27,7 +30,8 @@ That's it. Edit a workflow, commit, tag a release. Consumers pick up the change 
   - `cf-worker-deploy.yml` — wrangler deploy for CF Workers.
   - `pr-check-node.yml` — typecheck + lint + build for PRs on Node/TS repos.
   - `pr-check-gradle.yml`, `ghcr-compose-deploy.yml`, `release-please.yml` — Kotlin/Gradle PR gate, GHCR image + compose roll, and release-please (as a GitHub App: `RELEASE_APP_CLIENT_ID` / `RELEASE_APP_PRIVATE_KEY`, org secrets); copied from DanceClub-Platform/ci (private, not callable from here), runner label `[self-hosted, "021"]` (private repos only). Re-sync by diff when that repo changes.
-  - `check-go.yml` — the Go module gate (two jobs, `check` and `test`), reads 021is/code-rules with the release app's token; `ghcr-compose-deploy.yml`'s `go_module` / `image_var` build and switch a Go twin. Both ported from DanceClub-Platform/ci (2026-11-17, places' Go twin first).
+  - `check-go.yml` — the Go module gate (two jobs, `check` and `test`; tests `-race -shuffle=on`), reads 021is/code-rules with the release app's token; `ghcr-compose-deploy.yml`'s `go_module` / `image_var` build and switch a Go twin. Both ported from DanceClub-Platform/ci (2026-11-17, places' Go twin first).
+  - `main-gated.yml` — on push to main, every new commit came through a merged PR whose head was green.
 - `README.md` — humans + how to call from a consumer.
 - `CHANGELOG.md` — Keep-a-Changelog with `## [Unreleased]` block; `git tag v*` rolls via `git cliff`.
 
@@ -38,6 +42,8 @@ That's it. Edit a workflow, commit, tag a release. Consumers pick up the change 
 - **Concurrency:** `group: ${{ inputs.service }}-deploy` so two pushes to the same service don't race. `cancel-in-progress: true` for idempotent deploys; `false` for atomic-symlink ones (don't interrupt mid-swap).
 - **Naming:** kebab-case files. `<deploy-style>-deploy.yml` for deploys, `pr-check-<runtime>.yml` for PR gates, `notify-<channel>.yml` for notifications.
 - **Failure path:** every deploy workflow ends with a `notify` job that calls `notify-failure.yml@main` on `failure()`. Don't write inline curl-to-AM scripts in consumers — they drift.
+- **Nothing stays on the runner:** SSH keys and known_hosts live in `$RUNNER_TEMP/ssh` (used with `ssh -F`), removed in an `always()` step; never `~/.ssh`. The runners are persistent.
+- **A roll checks the platform:** the pulled image's os/arch must equal the host's before `up -d`.
 
 ## Active threads
 

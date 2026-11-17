@@ -412,15 +412,22 @@ jobs:
             echo "::error::Rolling needs remote_path and the SSH_HOST / SSH_KEY secrets; a build-only caller sets stage: build."
             exit 1
           fi
+      # The key and the host's key live in this job's own temp folder, never in the runner's
+      # ~/.ssh: a persistent runner keeps nothing of a job (removed again in the last step).
+      # `-F` reads only this config, never the runner's own.
       - name: Configure SSH
         env:
           SSH_KEY: ${{ secrets.SSH_KEY }}
           SSH_HOST: ${{ secrets.SSH_HOST }}
         run: |
-          install -m 700 -d ~/.ssh
-          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_ed25519
-          chmod 600 ~/.ssh/id_ed25519
-          ssh-keyscan -H "$SSH_HOST" >> ~/.ssh/known_hosts 2>/dev/null
+          set -euo pipefail
+          dir="$RUNNER_TEMP/ssh"
+          install -m 700 -d "$dir"
+          printf '%s\n' "$SSH_KEY" > "$dir/id_ed25519"
+          chmod 600 "$dir/id_ed25519"
+          ssh-keyscan -H "$SSH_HOST" > "$dir/known_hosts" 2>/dev/null
+          printf 'Host *\n  IdentityFile %s/id_ed25519\n  IdentitiesOnly yes\n  UserKnownHostsFile %s/known_hosts\n  StrictHostKeyChecking yes\n' "$dir" "$dir" > "$dir/config"
+          echo "SSH_CONFIG=$dir/config" >> "$GITHUB_ENV"
 
       - name: Pull and restart
         env:
@@ -476,12 +483,21 @@ jobs:
           trap 'docker logout ghcr.io >/dev/null 2>&1 || true' EXIT
 
           docker compose pull "$SERVICE"
+          # The image must be built for this host's platform: a single-platform image of another
+          # architecture pulls with only a warning and then dies with `exec format error`.
+          IMAGE=$(docker compose config --images "$SERVICE")
+          WANT=$(docker version --format '{{.Server.Os}}/{{.Server.Arch}}')
+          GOT=$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$IMAGE")
+          if [ "$GOT" != "$WANT" ]; then
+            echo "::error::${IMAGE} is ${GOT}; this host runs ${WANT}. Not rolled: build it for the host (the caller's platforms input)."
+            exit 1
+          fi
           # --no-build: the host must never build (see header).
           # --no-deps: a service deploy never restarts the database or broker
           #            underneath itself.
           docker compose up -d --no-build --no-deps "$SERVICE"
           REMOTE
-          } | ssh "${USER}@${SSH_HOST}" 'bash -euo pipefail -s'
+          } | ssh -F "$SSH_CONFIG" "${USER}@${SSH_HOST}" 'bash -euo pipefail -s'
 
       - name: Health check
         if: inputs.health_url != ''
@@ -510,7 +526,7 @@ jobs:
           cd "$REMOTE_PATH" && docker compose logs --tail=60 "$SERVICE"
           exit 1
           REMOTE
-          } | ssh "${USER}@${SSH_HOST}" 'bash -euo pipefail -s'
+          } | ssh -F "$SSH_CONFIG" "${USER}@${SSH_HOST}" 'bash -euo pipefail -s'
 
       # Healthy says something answers; this says it is the build this run rolled.
       - name: The running build is this commit
@@ -536,7 +552,7 @@ jobs:
           echo "❌ ${INFO_URL} does not name ${COMMIT}: ${info}"
           exit 1
           REMOTE
-          } | ssh "${USER}@${SSH_HOST}" 'bash -euo pipefail -s'
+          } | ssh -F "$SSH_CONFIG" "${USER}@${SSH_HOST}" 'bash -euo pipefail -s'
 
       - name: Summary
         if: success()
@@ -552,4 +568,9 @@ jobs:
               echo "- rollback: set \`${{ inputs.tag_var }}=sha-<older>\` in \`${{ inputs.remote_path }}/.env\`, then \`docker compose up -d --no-build --no-deps ${{ inputs.service }}\`"
             fi
           } >> "$GITHUB_STEP_SUMMARY"
+
+      # Whatever happened above, the key leaves the runner with the job.
+      - name: Remove the SSH key
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/ssh"
 

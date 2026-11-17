@@ -320,8 +320,9 @@ jobs:
       # Real databases through Testcontainers, one package at a time: the slots share the CI box.
       # Each package is its OWN `go test`: testcontainers-go gives every package of one `go test` one
       # shared reaper (Ryuk), and the next package found the last one's reaper shutting down. Every
-      # package runs; the step fails if any failed.
-      - name: Tests with the race detector
+      # package runs; the step fails if any failed. In a random order (-shuffle=on, its seed printed
+      # for a rerun): a test that passes only after another one leans on state it should reset.
+      - name: Tests with the race detector, in a random order
         env:
           CGO_ENABLED: "1"
         run: |
@@ -333,7 +334,7 @@ jobs:
           fi
           failed=()
           for pkg in $(go list ./...); do
-            go test -race "$pkg" || failed+=("$pkg")
+            go test -race -shuffle=on "$pkg" || failed+=("$pkg")
           done
           if [ ${#failed[@]} -gt 0 ]; then
             printf '::error::Tests failed in %s\n' "${failed[@]}"

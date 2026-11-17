@@ -96,15 +96,21 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      # The key and the host's key live in this job's own temp folder, never in the runner's
+      # ~/.ssh: a persistent runner keeps nothing of a job (removed again in the last step).
       - name: Configure SSH
         env:
           SSH_KEY: ${{ secrets.SSH_KEY }}
           SSH_HOST: ${{ secrets.SSH_HOST }}
         run: |
-          install -m 700 -d ~/.ssh
-          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_ed25519
-          chmod 600 ~/.ssh/id_ed25519
-          ssh-keyscan -H "$SSH_HOST" >> ~/.ssh/known_hosts 2>/dev/null
+          set -euo pipefail
+          dir="$RUNNER_TEMP/ssh"
+          install -m 700 -d "$dir"
+          printf '%s\n' "$SSH_KEY" > "$dir/id_ed25519"
+          chmod 600 "$dir/id_ed25519"
+          ssh-keyscan -H "$SSH_HOST" > "$dir/known_hosts" 2>/dev/null
+          printf 'Host *\n  IdentityFile %s/id_ed25519\n  IdentitiesOnly yes\n  UserKnownHostsFile %s/known_hosts\n  StrictHostKeyChecking yes\n' "$dir" "$dir" > "$dir/config"
+          echo "SSH_CONFIG=$dir/config" >> "$GITHUB_ENV"
 
       - name: Compute paths
         id: paths
@@ -130,8 +136,8 @@ jobs:
           while IFS= read -r pat; do
             [ -n "$pat" ] && excludes="$excludes --exclude=$pat"
           done <<< "${{ inputs.rsync_excludes }}"
-          ssh "${USER}@${SSH_HOST}" "install -m 755 -d '$REL_DIR'"
-          rsync -azv $excludes ./ "${USER}@${SSH_HOST}:${REL_DIR}/"
+          ssh -F "$SSH_CONFIG" "${USER}@${SSH_HOST}" "install -m 755 -d '$REL_DIR'"
+          rsync -azv -e "ssh -F $SSH_CONFIG" $excludes ./ "${USER}@${SSH_HOST}:${REL_DIR}/"
 
       - name: Install + (prisma) + build + migrate
         env:
@@ -140,7 +146,7 @@ jobs:
           REL_DIR: ${{ steps.paths.outputs.release_dir }}
           ROOT: ${{ steps.paths.outputs.release_root }}
         run: |
-          ssh "${USER}@${SSH_HOST}" "set -eu; cd '$REL_DIR'; \
+          ssh -F "$SSH_CONFIG" "${USER}@${SSH_HOST}" "set -eu; cd '$REL_DIR'; \
             if [ -n '${{ inputs.env_symlink_src }}' ]; then ln -sfn '${{ inputs.env_symlink_src }}' .env.local; fi; \
             ${{ inputs.install_cmd }}; \
             ${{ inputs.pre_build_cmd || 'true' }}; \
@@ -156,7 +162,7 @@ jobs:
           SYSTEMCTL: ${{ steps.paths.outputs.systemctl }}
           SERVICE: ${{ inputs.service }}
         run: |
-          ssh "${USER}@${SSH_HOST}" "set -eu; \
+          ssh -F "$SSH_CONFIG" "${USER}@${SSH_HOST}" "set -eu; \
             ln -sfn '$REL_DIR' '$ROOT/current.new'; \
             mv -Tf '$ROOT/current.new' '$ROOT/current'; \
             $SYSTEMCTL restart '${SERVICE}.service'; \
@@ -191,13 +197,18 @@ jobs:
           # side where the env var was unset, turning `tail -n +$((KEEP+1))`
           # into `tail -n +1` and deleting EVERY release including the active
           # one. Always exclude the SHA we just deployed from prune.
-          ssh "${USER}@${SSH_HOST}" bash -s <<REMOTE
+          ssh -F "$SSH_CONFIG" "${USER}@${SSH_HOST}" bash -s <<REMOTE
           set -eu
           cd "$ROOT/releases"
           for d in \$(ls -1t | grep -vx "$CURRENT_SHA" | tail -n +$KEEP); do
             rm -rf -- "\$d"
           done
           REMOTE
+
+      # Whatever happened above, the key leaves the runner with the job.
+      - name: Remove the SSH key
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/ssh"
 
   notify:
     name: Notify on failure

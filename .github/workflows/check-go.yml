@@ -236,12 +236,31 @@ jobs:
           SHA256_ARM64: e4a487ee7ccd7d3a7f7ec08657610aa3606637dab924210b3aee62570fb4b080
         run: *fetch-verified
 
-      # A secret in any commit of the history fails the check: the WHOLE history, the
-      # checksum-verified binary, no allowlist. Runs whatever failed before it.
-      - name: gitleaks over the whole history
+      # A secret fails the check in the tree as it stands and in every commit this run brings in: the
+      # checksum-verified binary, no allowlist (an inline `gitleaks:allow` is ignored). Both run
+      # whatever failed before them.
+      - name: gitleaks over the tree
         if: ${{ !cancelled() && steps.gitleaks.outcome == 'success' }}
         working-directory: .
-        run: '"$RUNNER_TEMP/bin/gitleaks" git --redact --no-banner --verbose .'
+        run: '"$RUNNER_TEMP/bin/gitleaks" dir --redact --no-banner --verbose --ignore-gitleaks-allow .'
+
+      # The range: a PR's commits over its base; a push's since the ref's last tip; else (a new ref,
+      # a manual run, a base this clone lacks) the last commit.
+      - name: gitleaks over the change's commits
+        if: ${{ !cancelled() && steps.gitleaks.outcome == 'success' }}
+        working-directory: .
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          set -euo pipefail
+          if [ -z "$BASE" ] || [ "$BASE" = "0000000000000000000000000000000000000000" ] \
+            || ! git cat-file -e "${BASE}^{commit}" 2>/dev/null; then
+            range="HEAD~1..HEAD"
+          else
+            range="${BASE}..HEAD"
+          fi
+          echo "commits scanned: ${range} ($(git rev-list --count "$range"))"
+          "$RUNNER_TEMP/bin/gitleaks" git --redact --no-banner --verbose --ignore-gitleaks-allow --log-opts="$range" .
 
   test:
     name: test

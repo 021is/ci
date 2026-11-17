@@ -29,6 +29,11 @@ name: Check (Go)
 # revoked when the job ends), or `GO_MODULES_TOKEN` where the app is not installed. A module that
 # requires another private 021is module is not supported yet: `test` holds no token.
 #
+# DanceClub's platform module (`danceclub_platform: true`, a 021 service built on
+# github.com/DanceClub-Platform/danceclub-platform/go, private): each job mints its own read token
+# for that one repo from the same release app (installed in both orgs), reaching git only through
+# GIT_CONFIG_* in the job's environment, never the runner's ~/.gitconfig.
+#
 # ⚠ Runs on the 021is org's own slots (`[self-hosted, "021"]`): private 021is repos only.
 
 on:
@@ -76,6 +81,13 @@ on:
         description: >-
           More KEY=VALUE lines the service needs to start on the staging profile, never a real
           secret: a value `@random` becomes 48 random bytes, base64 (a guard key).
+      danceclub_platform:
+        required: false
+        type: boolean
+        default: false
+        description: >-
+          The module requires DanceClub's private platform module: every job mints a read token for
+          DanceClub-Platform/danceclub-platform from the release app (its secrets are required then).
 
     secrets:
       RELEASE_APP_CLIENT_ID:
@@ -158,6 +170,29 @@ jobs:
       - name: The rules' commit
         working-directory: .
         run: echo "CODE_RULES_SHA=$(git -C .code-rules rev-parse HEAD)" >> "$GITHUB_ENV"
+
+      - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        id: platform
+        if: inputs.danceclub_platform
+        with:
+          client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          owner: DanceClub-Platform
+          repositories: danceclub-platform
+          permission-contents: read
+
+      - name: DanceClub's platform module through the token
+        if: inputs.danceclub_platform
+        working-directory: .
+        env:
+          TOKEN: ${{ steps.platform.outputs.token }}
+        run: |
+          {
+            echo "GIT_CONFIG_COUNT=1"
+            echo "GIT_CONFIG_KEY_0=url.https://x-access-token:${TOKEN}@github.com/DanceClub-Platform/.insteadOf"
+            echo "GIT_CONFIG_VALUE_0=https://github.com/DanceClub-Platform/"
+            echo "GOPRIVATE=github.com/DanceClub-Platform/*"
+          } >> "$GITHUB_ENV"
 
       # GitHub's cache only on GitHub's runners: on the org's own, the Go module, build and lint
       # caches are host folders that outlive the job.
@@ -302,6 +337,29 @@ jobs:
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
+      - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        id: platform
+        if: inputs.danceclub_platform
+        with:
+          client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          owner: DanceClub-Platform
+          repositories: danceclub-platform
+          permission-contents: read
+
+      - name: DanceClub's platform module through the token
+        if: inputs.danceclub_platform
+        working-directory: .
+        env:
+          TOKEN: ${{ steps.platform.outputs.token }}
+        run: |
+          {
+            echo "GIT_CONFIG_COUNT=1"
+            echo "GIT_CONFIG_KEY_0=url.https://x-access-token:${TOKEN}@github.com/DanceClub-Platform/.insteadOf"
+            echo "GIT_CONFIG_VALUE_0=https://github.com/DanceClub-Platform/"
+            echo "GOPRIVATE=github.com/DanceClub-Platform/*"
+          } >> "$GITHUB_ENV"
+
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: ${{ inputs.go_version }}
@@ -361,6 +419,29 @@ jobs:
 
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        id: platform
+        if: inputs.danceclub_platform
+        with:
+          client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          owner: DanceClub-Platform
+          repositories: danceclub-platform
+          permission-contents: read
+
+      - name: DanceClub's platform module through the token
+        if: inputs.danceclub_platform
+        working-directory: .
+        env:
+          TOKEN: ${{ steps.platform.outputs.token }}
+        run: |
+          {
+            echo "GIT_CONFIG_COUNT=1"
+            echo "GIT_CONFIG_KEY_0=url.https://x-access-token:${TOKEN}@github.com/DanceClub-Platform/.insteadOf"
+            echo "GIT_CONFIG_VALUE_0=https://github.com/DanceClub-Platform/"
+            echo "GOPRIVATE=github.com/DanceClub-Platform/*"
+          } >> "$GITHUB_ENV"
 
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:

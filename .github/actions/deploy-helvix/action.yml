@@ -27,7 +27,7 @@ inputs:
     description: 'Registry password (HELVIX_REGISTRY_PASSWORD).'
     required: true
   infra-push-token:
-    description: 'PAT with `repo` write access to the infra-repo (INFRA_PUSH_TOKEN).'
+    description: 'PAT with `repo` write access to the infra-repo (INFRA_PUSH_TOKEN): it pushes the bump branch and opens its PR.'
     required: true
   infra-repo:
     description: 'Target 021-infra repo (owner/name).'
@@ -80,29 +80,61 @@ runs:
         docker push "${{ steps.tag.outputs.image_ref }}"
         docker push "${{ inputs.registry }}/${{ inputs.app-name }}:prod"
 
+    # 021-infra's main takes only pull requests whose checks passed (its ruleset; admins and
+    # this token included), so the bump is a PR that merges itself once green, and this step
+    # waits for that merge: a red or stuck bump fails the deploy here, not in a smoke timeout.
+    # No `[skip ci]` in the commit: on a PR it would skip the very check the merge waits for.
     - name: Bump tag in 021-infra
       shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.infra-push-token }}
+        APP: ${{ inputs.app-name }}
+        TAG: ${{ steps.tag.outputs.image_tag }}
+        INFRA: ${{ inputs.infra-repo }}
       run: |
-        set -e
+        set -euo pipefail
+        command -v gh >/dev/null || { echo "::error::the gh CLI is needed on this runner to open the bump PR"; exit 1; }
         INFRA_DIR="$RUNNER_TEMP/infra-bump"
-        git clone --depth 1 \
-          "https://x-access-token:${{ inputs.infra-push-token }}@github.com/${{ inputs.infra-repo }}.git" \
-          "$INFRA_DIR"
+        git clone --depth 1 "https://x-access-token:${GH_TOKEN}@github.com/${INFRA}.git" "$INFRA_DIR"
         cd "$INFRA_DIR"
-        VALUES="apps/${{ inputs.app-name }}/values.yaml"
+        VALUES="apps/${APP}/values.yaml"
         if [ ! -f "$VALUES" ]; then
-          echo "::error::$VALUES not found in ${{ inputs.infra-repo }}"
+          echo "::error::$VALUES not found in ${INFRA}"
           exit 1
         fi
         # bump image.tag: line (preserves indent, in-place)
-        sed -i -E "s|^([[:space:]]+tag:[[:space:]]+).+$|\1${{ steps.tag.outputs.image_tag }}|" "$VALUES"
+        sed -i -E "s|^([[:space:]]+tag:[[:space:]]+).+$|\1${TAG}|" "$VALUES"
         if git diff --quiet "$VALUES"; then
-          echo "::notice::No tag change for ${{ inputs.app-name }} (already ${{ steps.tag.outputs.image_tag }})"
+          echo "::notice::No tag change for ${APP} (already ${TAG})"
           exit 0
         fi
-        git -c user.email='ci@helvix' -c user.name='helvix-ci' \
-          commit -m "deploy(${{ inputs.app-name }}): ${{ steps.tag.outputs.image_tag }} [skip ci]" "$VALUES"
-        git push origin HEAD:main
+        BRANCH="deploy/${APP}-${TAG}"
+        TITLE="deploy(${APP}): ${TAG}"
+        git switch -q -c "$BRANCH"
+        git -c user.email='ci@helvix' -c user.name='helvix-ci' commit -q -m "$TITLE" "$VALUES"
+        git push -q origin "$BRANCH"
+        url=$(gh pr create -R "$INFRA" --base main --head "$BRANCH" --title "$TITLE" \
+          --body "From ${GITHUB_REPOSITORY}@${GITHUB_SHA} (run ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}). Merges itself once its checks pass.")
+        gh pr merge "$url" --auto --rebase --delete-branch
+        echo "Bump PR: $url"
+        # Up to 15 minutes. Behind main (another merge landed first): rebased onto it, and the
+        # check runs again.
+        for _ in $(seq 1 60); do
+          read -r state merge failed < <(gh pr view "$url" --json state,mergeStateStatus,statusCheckRollup \
+            --jq '"\(.state) \(.mergeStateStatus) \([.statusCheckRollup[] | select(.conclusion == "FAILURE")] | length)"')
+          case "$state" in
+            MERGED) echo "Merged: Argo CD rolls ${APP} within ~3 min."; exit 0 ;;
+            CLOSED) echo "::error::$url was closed unmerged; nothing rolled."; exit 1 ;;
+          esac
+          if [ "$failed" != 0 ]; then
+            echo "::error::a check failed on $url; nothing rolled."
+            exit 1
+          fi
+          if [ "$merge" = BEHIND ]; then gh pr update-branch "$url" --rebase || true; fi
+          sleep 15
+        done
+        echo "::error::$url did not merge within 15 minutes; nothing rolled yet."
+        exit 1
 
     - name: Summary
       shell: bash

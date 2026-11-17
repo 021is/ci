@@ -11,7 +11,7 @@ Coding rules: 021is/code-rules v0.6.0 (PRINCIPLES; workflows only, no language f
 
 - **Language:** YAML (GitHub Actions). No runtime code lives here.
 - **Versioning:** semver via git tags (`v1.0.0`, `v1.1.0`, …). Consumers pin `@v1`.
-- **No CI of its own (yet).** Reusable workflows aren't executed standalone — they run when called from a consumer repo's workflow.
+- **Its own CI:** `self-check.yml` runs `check-repo.yml` from the same commit (`repo / check`, required by main's ruleset): every YAML/JSON parses, `bash -n`, gitleaks over the tree and history. The other reusable workflows run only when a consumer calls them.
 
 ## Boot
 

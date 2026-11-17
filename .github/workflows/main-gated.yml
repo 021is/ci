@@ -1,0 +1,72 @@
+name: main gated
+
+# Every commit a push brings to main came through a merged pull request whose head passed every
+# check: a commit pushed straight to main, or merged while a check failed or never ran, fails this
+# job and names the commit. The gate is the pull request's CI; this job proves main only took what
+# passed it (code-rules PRINCIPLES § How a change is made). A consumer calls it on push to main:
+#
+#   on: { push: { branches: [main] } }
+#   jobs:
+#     gated:
+#       uses: 021is/ci/.github/workflows/main-gated.yml@<commit>
+#       with: { runs_on: '["self-hosted", "021"]' }
+#
+# A release-please pull request (head branch `release-please--…`) may carry no checks (a token
+# that starts no workflow opened it); a failing one still fails.
+
+on:
+  workflow_call:
+    inputs:
+      runs_on:
+        description: The runner labels as a JSON array (each org's own runners).
+        type: string
+        required: true
+
+permissions:
+  contents: read
+  pull-requests: read
+  checks: read
+
+jobs:
+  gated:
+    name: gated
+    runs-on: ${{ fromJSON(inputs.runs_on) }}
+    timeout-minutes: 5
+    steps:
+      - name: Every new commit on main came through a green pull request
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.event.after }}
+        run: |
+          set -euo pipefail
+          if [[ "$BEFORE" =~ ^0+$ ]]; then
+            commits="$AFTER"
+          else
+            commits=$(gh api "repos/$REPO/compare/$BEFORE...$AFTER" --jq '.commits[].sha')
+          fi
+          bad=0
+          for sha in $commits; do
+            pr=$(gh api "repos/$REPO/commits/$sha/pulls" \
+              --jq '[.[] | select(.merged_at != null and .base.ref == "main")][0] // empty | "\(.number) \(.head.sha) \(.head.ref)"')
+            if [ -z "$pr" ]; then
+              echo "::error::$sha reached main without a merged pull request."
+              bad=1; continue
+            fi
+            read -r number head ref <<<"$pr"
+            conclusions=$(gh api --paginate "repos/$REPO/commits/$head/check-runs" --jq '.check_runs[].conclusion')
+            if [ -z "$conclusions" ] && [[ "$ref" != release-please--* ]]; then
+              echo "::error::$sha came through #$number, whose head $head ran no check."
+              bad=1; continue
+            fi
+            # A check still running at the merge has no conclusion ("null"): not green either.
+            failing=0
+            [ -z "$conclusions" ] || failing=$(grep -cvxE 'success|skipped|neutral' <<<"$conclusions" || true)
+            if [ "$failing" -gt 0 ]; then
+              echo "::error::$sha came through #$number, whose head $head has $failing check(s) not green."
+              bad=1; continue
+            fi
+            echo "$sha: #$number, head $head green"
+          done
+          exit "$bad"

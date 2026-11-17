@@ -1,5 +1,8 @@
 # 021 CI
 
+Coding rules: 021is/code-rules v0.6.0 (PRINCIPLES; workflows only, no language file), then this
+repo's AGENTS.md § Conventions.
+
 Central library of reusable GitHub Actions workflows for every repo in `021is/`.
 
 One source of truth for: deploy patterns, alert wiring, PR gates. Fix a bug here, every consumer inherits the fix on the next workflow run.
@@ -13,6 +16,7 @@ One source of truth for: deploy patterns, alert wiring, PR gates. Fix a bug here
 | [`pr-check-gradle.yml`](.github/workflows/pr-check-gradle.yml) | One-job PR gate for Kotlin/Gradle repos (ktlint, detekt, test, apiCheck, then gitleaks over the history). Runs on the 021is slot (`[self-hosted, "021"]`): private repos only. Optional secret `GPR_TOKEN` (read:packages, for sibling repos' Maven packages). |
 | [`ghcr-compose-deploy.yml`](.github/workflows/ghcr-compose-deploy.yml) | Build the image in CI, push to `ghcr.io/<repo owner>/<service>`, Trivy-scan it, then pull and restart one compose service over SSH (`stage: build`/`roll`/`all`). Same runner rule. Secrets: `SSH_HOST`, `SSH_KEY` (to roll), `GPR_TOKEN` (optional). A Go twin: `go_module` builds the static binary outside Docker, `image_var` writes the one `.env` line that says which twin runs. |
 | [`check-go.yml`](.github/workflows/check-go.yml) | The gate for a Go module: `check` (build, vet, golangci-lint with code-rules' shared config, go-rules, govulncheck, gitleaks) and `test` (race tests, Testcontainers) at once; with `image_service`, a third, `image`: the deploy image built and run as the host runs it (non-root, health 200 on a real Postgres, info names the commit, SIGTERM exit 0). Same runner rule. Input `code_rules_ref` (a 021is/code-rules tag or full commit). Secrets: `RELEASE_APP_CLIENT_ID`, `RELEASE_APP_PRIVATE_KEY` (read code-rules), or `GO_MODULES_TOKEN`. |
+| [`main-gated.yml`](.github/workflows/main-gated.yml) | On push to main: every new commit came through a merged pull request whose head passed every check, else it fails and names the commit (a release-please PR may carry none). Input `runs_on` (JSON labels). No secrets. |
 | [`release-please.yml`](.github/workflows/release-please.yml) | Versions a repo from its conventional commits: one open release PR (`version.txt`, `CHANGELOG.md`); merging it tags `v<version>` and reports `release_created` for a publish chained in the same run. Acts as a GitHub App, never `GITHUB_TOKEN` (whose PRs start no check). Same runner rule. Secrets: `RELEASE_APP_CLIENT_ID`, `RELEASE_APP_PRIVATE_KEY`. |
 | [`ssh-systemd-deploy.yml`](.github/workflows/ssh-systemd-deploy.yml) | Atomic releases-style deploy for Bun/Node apps behind systemd. Builds in `releases/<sha>`, swaps `current` symlink, restarts service, health-checks. |
 | [`cf-worker-deploy.yml`](.github/workflows/cf-worker-deploy.yml) | `wrangler deploy` for Cloudflare Workers (parked, future edge services). |

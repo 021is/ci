@@ -38,6 +38,15 @@ name: GHCR + compose deploy
 #
 # `stage: all` (the default) builds and rolls in one call, ungated.
 #
+# ── A Go twin (a Kotlin service rewritten in Go, switched by one .env line) ───
+# `go_module: go` builds `go/cmd/<service>` here, outside Docker, into `go/dist/<service>`
+# (the Dockerfile copies it: `dockerfile: go/Dockerfile`, `build_context: go`). Give it
+# its own `image_name` (`<image>-go`) so the Kotlin twin's images and moving tag stay,
+# and `image_var` (`<SVC>_IMAGE`) so the roll writes the one line that says which twin
+# runs; `tag_var` keeps naming the Kotlin twin, the way back. Copied from
+# DanceClub-Platform/ci's, without its private-module token: a 021is Go module that
+# requires another private module is not supported yet.
+#
 # ⚠ `@main` until the release tag that carries this workflow exists (v1.2.0); pin that tag then.
 
 on:
@@ -113,6 +122,30 @@ on:
         type: string
         default: "21"
         description: "Temurin JDK Gradle itself runs on (see pr-check-gradle.yml)."
+
+      go_module:
+        required: false
+        type: string
+        default: ""
+        description: >-
+          A Go module's folder (e.g. `go`). Builds its `cmd/<service>` as one static binary for the
+          first of `platforms`, OUTSIDE Docker, at `<go_module>/dist/<service>`, for the Dockerfile
+          to copy. The commit is in the binary (Go's vcs stamp, read from the checkout). Empty: no Go.
+      go_version:
+        required: false
+        type: string
+        default: "1.27"
+        description: "The Go release for `go_module` (its go.mod's `go` line), as check-go.yml."
+      image_var:
+        required: false
+        type: string
+        default: ""
+        description: >-
+          Write the whole image reference, `<IMAGE_VAR>=ghcr.io/<org>/<image>:sha-<8>`, to the
+          host's `.env` INSTEAD of `tag_var`: the one line that says which of a service's twins
+          runs. The compose file reads it first, e.g.
+          `${SVC_IMAGE:-ghcr.io/<org>/<svc>:${SVC_TAG:-staging}}`, so `tag_var` keeps naming the
+          other twin and deleting this line rolls back to it.
 
       tag_var:
         required: false
@@ -243,6 +276,33 @@ jobs:
           GPR_TOKEN: ${{ secrets.GPR_TOKEN }}
         run: ${{ inputs.pre_build_cmd }}
 
+      # ── Go (`go_module`): one static binary for the hosts' architecture, built here and copied by
+      # the Dockerfile.
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        if: inputs.go_module != ''
+        with:
+          go-version: ${{ inputs.go_version }}
+          cache: ${{ runner.environment != 'self-hosted' }}
+          cache-dependency-path: ${{ inputs.go_module }}/go.sum
+
+      # Static (no cgo: alpine's musl and the binary never meet), trimmed paths, the vcs stamp kept:
+      # `/actuator/info` reads the commit from it. One platform only: the first of `platforms`.
+      - name: Build the Go binary
+        if: inputs.go_module != ''
+        working-directory: ${{ inputs.go_module }}
+        env:
+          GOFLAGS: -mod=readonly
+          GOWORK: "off"
+          CGO_ENABLED: "0"
+          PLATFORMS: ${{ inputs.platforms }}
+          SERVICE: ${{ inputs.service }}
+        run: |
+          set -euo pipefail
+          FIRST="${PLATFORMS%%,*}"
+          export GOOS="${FIRST%%/*}" GOARCH="${FIRST#*/}"
+          go build -trimpath -buildvcs=true -o "dist/${SERVICE}" "./cmd/${SERVICE}"
+          go version -m "dist/${SERVICE}" | grep -E 'vcs\.(revision|modified)'
+
       - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
 
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
@@ -363,20 +423,34 @@ jobs:
           # removes it from ~/.docker/config.json before we disconnect.
           REG_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REG_USER: ${{ github.actor }}
+          SERVICE: ${{ inputs.service }}
+          IMAGE_NAME: ${{ inputs.image_name }}
+          IMAGE_VAR: ${{ inputs.image_var }}
+          TAG_VAR: ${{ inputs.tag_var }}
         run: |
           set -euo pipefail
           # Everything — values included — travels on stdin. Passing the registry
           # token as an ssh command argument would put it in the host's process
           # list, and these hosts are shared.
+          # Same derivation as the build job's `Image coordinates` — the build
+          # job may not have run in this call (`stage: roll`).
+          TAG="sha-${GITHUB_SHA:0:8}"
+          # `image_var`: the whole reference on its own line (which twin runs), and
+          # `tag_var` left alone, still naming the other twin. Otherwise the tag only.
+          if [ -n "$IMAGE_VAR" ]; then
+            NAME="${IMAGE_NAME:-$SERVICE}"
+            OWNER=$(echo "${GITHUB_REPOSITORY%%/*}" | tr '[:upper:]' '[:lower:]')
+            LINE_VAR="$IMAGE_VAR" LINE_VALUE="ghcr.io/${OWNER}/${NAME}:${TAG}"
+          else
+            LINE_VAR="$TAG_VAR" LINE_VALUE="$TAG"
+          fi
           {
             printf 'REG_USER=%q\n'     "$REG_USER"
             printf 'REG_TOKEN=%q\n'    "$REG_TOKEN"
             printf 'REMOTE_PATH=%q\n'  '${{ inputs.remote_path }}'
-            printf 'SERVICE=%q\n'      '${{ inputs.service }}'
-            printf 'TAG_VAR=%q\n'      '${{ inputs.tag_var }}'
-            # Same derivation as the build job's `Image coordinates` — the build
-            # job may not have run in this call (`stage: roll`).
-            printf 'TAG=%q\n'          "sha-${GITHUB_SHA:0:8}"
+            printf 'SERVICE=%q\n'      "$SERVICE"
+            printf 'LINE_VAR=%q\n'     "$LINE_VAR"
+            printf 'LINE_VALUE=%q\n'   "$LINE_VALUE"
             cat <<'REMOTE'
           cd "$REMOTE_PATH"
 
@@ -384,10 +458,10 @@ jobs:
           # reading `docker ps`; the deploy itself is always by digest-stable sha
           # tag, so a rollback is "set this line to an older sha, re-up".
           touch .env
-          if grep -q "^${TAG_VAR}=" .env; then
-            sed -i "s|^${TAG_VAR}=.*|${TAG_VAR}=${TAG}|" .env
+          if grep -q "^${LINE_VAR}=" .env; then
+            sed -i "s|^${LINE_VAR}=.*|${LINE_VAR}=${LINE_VALUE}|" .env
           else
-            printf '%s=%s\n' "$TAG_VAR" "$TAG" >> .env
+            printf '%s=%s\n' "$LINE_VAR" "$LINE_VALUE" >> .env
           fi
 
           echo "$REG_TOKEN" | docker login ghcr.io -u "$REG_USER" --password-stdin
@@ -438,6 +512,10 @@ jobs:
             echo
             echo "- image tag: \`sha-${GITHUB_SHA:0:8}\`"
             echo "- host path: \`${{ inputs.remote_path }}\`"
-            echo "- rollback: set \`${{ inputs.tag_var }}=sha-<older>\` in \`${{ inputs.remote_path }}/.env\`, then \`docker compose up -d --no-build --no-deps ${{ inputs.service }}\`"
+            if [ -n "${{ inputs.image_var }}" ]; then
+              echo "- rollback to the other twin: delete \`${{ inputs.image_var }}\` from \`${{ inputs.remote_path }}/.env\` (\`${{ inputs.tag_var }}\` names it), then \`docker compose up -d --no-build --no-deps ${{ inputs.service }}\`"
+            else
+              echo "- rollback: set \`${{ inputs.tag_var }}=sha-<older>\` in \`${{ inputs.remote_path }}/.env\`, then \`docker compose up -d --no-build --no-deps ${{ inputs.service }}\`"
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
 

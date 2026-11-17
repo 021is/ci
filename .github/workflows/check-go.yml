@@ -1,0 +1,294 @@
+name: Check (Go)
+
+# Reusable workflow — the gate for a Go module of a 021is repo (code-rules go/CODING-RULES.md
+# § Checks). Copied from DanceClub-Platform/ci's check-go.yml (private, not callable from here),
+# then split in TWO jobs that run at once on the org's two slots, so a check stays under 3 minutes:
+#
+#   check  build, vet, golangci-lint with the shared config, go-rules, govulncheck, gitleaks
+#   test   the tests with the race detector (Testcontainers: the runner's Docker)
+#
+# Inside a job every check after the build runs even when one before it failed, so one failure never
+# masks another. The checks are `<caller job> / check` and `<caller job> / test`.
+#
+# The caller (`.github/workflows/go.yml`):
+#
+#   on:
+#     pull_request: { branches: [main], paths: ["go/**", ".github/workflows/go.yml"] }
+#     push: { branches: [feat/go], paths: ["go/**", ".github/workflows/go.yml"] }
+#   jobs:
+#     go:
+#       uses: 021is/ci/.github/workflows/check-go.yml@<this repo's tag or commit>
+#       with: { code_rules_ref: "<021is/code-rules tag or full commit>" }
+#       secrets: inherit
+#
+# The rules: 021is/code-rules is private, so `check` reads it with a token minted from the release
+# app (`RELEASE_APP_CLIENT_ID` / `RELEASE_APP_PRIVATE_KEY`, contents: read on code-rules only,
+# revoked when the job ends), or `GO_MODULES_TOKEN` where the app is not installed. A module that
+# requires another private 021is module is not supported yet: `test` holds no token.
+#
+# ⚠ Runs on the 021is org's own slots (`[self-hosted, "021"]`): private 021is repos only.
+
+on:
+  workflow_call:
+    inputs:
+      code_rules_ref:
+        required: true
+        type: string
+        description: >-
+          The 021is/code-rules release (vX.Y.Z), Go module tag (go/vX.Y.Z) or full 40-hex commit
+          whose go/.golangci.yml the module's copy must equal byte for byte, and whose go-rules runs
+          over the module. A branch is refused: what it names moves.
+      working_directory:
+        required: false
+        type: string
+        default: go
+        description: "The module's folder, where go.mod and its .golangci.yml copy live."
+      go_version:
+        required: false
+        type: string
+        default: "1.27"
+        description: "The Go release the module is built and tested with (its go.mod's `go` line)."
+
+    secrets:
+      RELEASE_APP_CLIENT_ID:
+        required: false
+      RELEASE_APP_PRIVATE_KEY:
+        required: false
+      # Optional instead of the app: a token with contents: read on 021is/code-rules.
+      GO_MODULES_TOKEN:
+        required: false
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GOFLAGS: -mod=readonly
+  # A go.work links a local checkout; CI builds against what go.mod names, only.
+  GOWORK: "off"
+
+jobs:
+  check:
+    name: check
+    runs-on: [self-hosted, "021"]
+    permissions:
+      contents: read
+    env:
+      HAS_APP: ${{ secrets.RELEASE_APP_CLIENT_ID != '' }}
+    defaults:
+      run:
+        working-directory: ${{ inputs.working_directory }}
+
+    steps:
+      # The caller's ref goes into a checkout: only a release, a Go module tag or a full commit gets
+      # that far. Read from the environment, never spliced into the script.
+      - name: code_rules_ref is a tag or a commit
+        working-directory: .
+        env:
+          REF: ${{ inputs.code_rules_ref }}
+        run: |
+          if ! [[ "$REF" =~ ^(go/)?v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ || "$REF" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::code_rules_ref must be a code-rules tag (vX.Y.Z or go/vX.Y.Z) or a full 40-hex commit."
+            exit 1
+          fi
+
+      # Third-party actions are pinned to a full commit SHA, the release in the comment (see
+      # pr-check-gradle.yml). The whole history: gitleaks reads it all.
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          fetch-depth: 0
+
+      - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        id: app
+        if: env.HAS_APP == 'true'
+        with:
+          client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          owner: 021is
+          repositories: code-rules
+          permission-contents: read
+
+      - name: A token for the rules
+        working-directory: .
+        env:
+          TOKEN: ${{ steps.app.outputs.token || secrets.GO_MODULES_TOKEN }}
+        run: |
+          if [ -z "$TOKEN" ]; then
+            echo "::error::No token for 021is/code-rules: pass the release app's secrets or GO_MODULES_TOKEN (secrets: inherit)."
+            exit 1
+          fi
+
+      # The rules at the named ref, beside the module, never inside it (no linter or gitleaks reads it).
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          repository: 021is/code-rules
+          ref: ${{ inputs.code_rules_ref }}
+          token: ${{ steps.app.outputs.token || secrets.GO_MODULES_TOKEN }}
+          path: .code-rules
+          persist-credentials: false
+
+      - name: The rules' commit
+        working-directory: .
+        run: echo "CODE_RULES_SHA=$(git -C .code-rules rev-parse HEAD)" >> "$GITHUB_ENV"
+
+      # GitHub's cache only on GitHub's runners: on the org's own, the Go module, build and lint
+      # caches are host folders that outlive the job.
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ inputs.go_version }}
+          cache: ${{ runner.environment != 'self-hosted' }}
+          cache-dependency-path: ${{ inputs.working_directory }}/go.sum
+
+      - name: Build
+        id: build
+        run: go build ./...
+
+      - name: Vet
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: go vet ./...
+
+      # Every scanner is a release binary checked against the release's own SHA-256, one pin per runner
+      # architecture. The script is written once, here, and aliased (`*fetch-verified`) by every fetch
+      # step: TOOL names it, URL and MEMBER (its path in the archive) take {version} and {arch},
+      # ARCH_<X64|ARM64> is the release's name for the architecture. It lands in $RUNNER_TEMP/bin.
+      - name: Fetch golangci-lint
+        id: golangci-lint
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        working-directory: .
+        env:
+          TOOL: golangci-lint
+          VERSION: 2.15.0
+          URL: https://github.com/golangci/golangci-lint/releases/download/v{version}/golangci-lint-{version}-linux-{arch}.tar.gz
+          MEMBER: golangci-lint-{version}-linux-{arch}/golangci-lint
+          ARCH_X64: amd64
+          ARCH_ARM64: arm64
+          # From the release's own golangci-lint-2.15.0-checksums.txt.
+          SHA256_X64: 9b7fe6a6bf6334b98decf8d86b11415ea7889afdabdd1959fdce23af2a9ebcea
+          SHA256_ARM64: b4d8f17068b35ee6060cc2f69a16fb48740d706fbba81661c318649c114a6998
+        run: &fetch-verified |
+          set -euo pipefail
+          case "$RUNNER_ARCH" in
+            X64) arch=$ARCH_X64 sha256=$SHA256_X64 ;;
+            ARM64) arch=$ARCH_ARM64 sha256=$SHA256_ARM64 ;;
+            *) echo "::error::No ${TOOL} pin for ${RUNNER_ARCH}."; exit 1 ;;
+          esac
+          fill() { local s=${1//'{version}'/$VERSION}; echo "${s//'{arch}'/$arch}"; }
+          archive="$RUNNER_TEMP/${TOOL}.tar.gz"
+          curl -sSfL --retry 5 --retry-all-errors --retry-delay 5 -o "$archive" "$(fill "$URL")"
+          echo "${sha256}  ${archive}" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/bin"
+          tar xzf "$archive" -O "$(fill "$MEMBER")" > "$RUNNER_TEMP/bin/${TOOL}"
+          chmod +x "$RUNNER_TEMP/bin/${TOOL}"
+
+      # The shared config is code-rules' go/.golangci.yml, copied byte for byte (never edited in the
+      # module): this step fails on a copy that drifted from the commit the module names.
+      - name: golangci-lint with the shared config
+        if: ${{ !cancelled() && steps.golangci-lint.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          if ! cmp -s "$GITHUB_WORKSPACE/.code-rules/go/.golangci.yml" .golangci.yml; then
+            echo "::error::.golangci.yml is not code-rules' go/.golangci.yml at ${CODE_RULES_SHA}: copy it byte for byte, never edit it here."
+            exit 1
+          fi
+          "$RUNNER_TEMP/bin/golangci-lint" run ./...
+
+      # Built from the rules' own module at the commit (its go.mod names only public modules).
+      - name: go-rules
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          go build -C "$GITHUB_WORKSPACE/.code-rules/go" -o "$RUNNER_TEMP/bin/go-rules" ./cmd/go-rules
+          "$RUNNER_TEMP/bin/go-rules" .
+
+      # golang/vuln publishes no release binary, so govulncheck is built from its module at a pinned
+      # version whose hash is pinned too: SUM is the module's h1: hash as the Go checksum database
+      # records it (sum.golang.org/lookup/golang.org/x/vuln@v1.9.0). The checksum database is forced on.
+      - name: govulncheck
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        env:
+          VERSION: v1.9.0
+          SUM: h1:12VaqnI9kJfqwRoPptxoqsUhQtdfrSbdksT7X/KY/sc=
+          GOSUMDB: sum.golang.org
+          GONOSUMDB: ""
+          GOINSECURE: ""
+          GOBIN: ${{ runner.temp }}/bin
+        run: |
+          set -euo pipefail
+          if ! go mod download -json "golang.org/x/vuln@${VERSION}" | grep -qF "\"Sum\": \"${SUM}\","; then
+            echo "::error::golang.org/x/vuln@${VERSION} does not hash to the pinned ${SUM}."
+            exit 1
+          fi
+          go install "golang.org/x/vuln/cmd/govulncheck@${VERSION}"
+          "$GOBIN/govulncheck" ./...
+
+      - name: Fetch gitleaks
+        id: gitleaks
+        if: ${{ !cancelled() }}
+        working-directory: .
+        env:
+          TOOL: gitleaks
+          VERSION: 8.30.1
+          URL: https://github.com/gitleaks/gitleaks/releases/download/v{version}/gitleaks_{version}_linux_{arch}.tar.gz
+          MEMBER: gitleaks
+          ARCH_X64: x64
+          ARCH_ARM64: arm64
+          SHA256_X64: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+          SHA256_ARM64: e4a487ee7ccd7d3a7f7ec08657610aa3606637dab924210b3aee62570fb4b080
+        run: *fetch-verified
+
+      # A secret in any commit of the history fails the check: the WHOLE history, the
+      # checksum-verified binary, no allowlist. Runs whatever failed before it.
+      - name: gitleaks over the whole history
+        if: ${{ !cancelled() && steps.gitleaks.outcome == 'success' }}
+        working-directory: .
+        run: '"$RUNNER_TEMP/bin/gitleaks" git --redact --no-banner --verbose .'
+
+  test:
+    name: test
+    runs-on: [self-hosted, "021"]
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: ${{ inputs.working_directory }}
+
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ inputs.go_version }}
+          cache: ${{ runner.environment != 'self-hosted' }}
+          cache-dependency-path: ${{ inputs.working_directory }}/go.sum
+
+      # The race detector needs cgo, so a C compiler; the runner image has none, and Go then turns cgo
+      # off ("-race requires cgo"). Installed only when missing.
+      - name: A C compiler for the race detector
+        run: |
+          if ! command -v gcc >/dev/null; then
+            sudo apt-get update -qq
+            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends gcc libc6-dev
+          fi
+
+      # Real databases through Testcontainers, one package at a time: the slots share the CI box.
+      # Each package is its OWN `go test`: testcontainers-go gives every package of one `go test` one
+      # shared reaper (Ryuk), and the next package found the last one's reaper shutting down. Every
+      # package runs; the step fails if any failed.
+      - name: Tests with the race detector
+        env:
+          CGO_ENABLED: "1"
+        run: |
+          set -uo pipefail
+          # Every test binary compiled first, all packages at once (-c: compile, never run); the loop
+          # then reuses the build cache. Not fatal: the loop still names a package that fails to build.
+          if ! out=$(go test -race -c -o "$RUNNER_TEMP/test-bin/" ./... 2>&1); then
+            printf '::warning::The parallel test compile failed; the packages compile one by one.\n%s\n' "$out"
+          fi
+          failed=()
+          for pkg in $(go list ./...); do
+            go test -race "$pkg" || failed+=("$pkg")
+          done
+          if [ ${#failed[@]} -gt 0 ]; then
+            printf '::error::Tests failed in %s\n' "${failed[@]}"
+            exit 1
+          fi

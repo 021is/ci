@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `check-go.yml`: the gate for a Go module, in two jobs at once (`check`: build, vet,
+  golangci-lint with 021is/code-rules' shared config at `code_rules_ref`, go-rules, govulncheck,
+  gitleaks; `test`: the race tests), so a run stays under 3 minutes on the org's two slots. Copied
+  from DanceClub-Platform/ci's one-job version, which a 021is repo cannot call.
+- `ghcr-compose-deploy.yml`: `go_module` (the static Go binary built outside Docker, the commit in
+  its vcs stamp) and `image_var` (the whole image reference written to `.env`, the one line that
+  says which of a service's twins runs; `tag_var` keeps naming the other, the way back). Both
+  optional: every existing caller is unchanged.
+
 - `release-please.yml`: versions a repo from its conventional commits and tags `v<version>` when
   its release PR is merged, acting as a GitHub App (`RELEASE_APP_CLIENT_ID`,
   `RELEASE_APP_PRIVATE_KEY`). Copied from DanceClub-Platform/ci, whose private workflow a 021is

@@ -6,6 +6,9 @@ name: Check (Go)
 #
 #   check  build, vet, golangci-lint with the shared config, go-rules, govulncheck, gitleaks
 #   test   the tests with the race detector (Testcontainers: the runner's Docker)
+#   image  with `image_service` only: the deploy image built and run as the host runs it (non-root,
+#          health 200 on a real Postgres, info names the commit, SIGTERM exit 0); DanceClub-Platform/ci's
+#          same job (TF96), so the two stay one design
 #
 # Inside a job every check after the build runs even when one before it failed, so one failure never
 # masks another. The checks are `<caller job> / check` and `<caller job> / test`.
@@ -48,6 +51,31 @@ on:
         type: string
         default: "1.27"
         description: "The Go release the module is built and tested with (its go.mod's `go` line)."
+      image_service:
+        required: false
+        type: string
+        default: ""
+        description: >-
+          The service whose deploy image the `image` job builds and runs (`cmd/<it>`, the module's
+          `Dockerfile`): non-root, /actuator/health 200 against a real Postgres, /actuator/info naming
+          this commit, SIGTERM drained with exit 0. Empty: no image job.
+      image_schema:
+        required: false
+        type: string
+        default: ""
+        description: "The schema the service owns (made by the admin, as on the host; never by the service)."
+      image_extensions:
+        required: false
+        type: string
+        default: ""
+        description: "Postgres extensions the admin creates first, space-separated (the host has them), e.g. `postgis`."
+      image_env:
+        required: false
+        type: string
+        default: ""
+        description: >-
+          More KEY=VALUE lines the service needs to start on the staging profile, never a real
+          secret: a value `@random` becomes 48 random bytes, base64 (a guard key).
 
     secrets:
       RELEASE_APP_CLIENT_ID:
@@ -311,3 +339,135 @@ jobs:
             printf '::error::Tests failed in %s\n' "${failed[@]}"
             exit 1
           fi
+
+  # The deploy image, built and run as the host runs it, beside `check` and `test`: the binary built as
+  # ghcr-compose-deploy.yml builds it (static, -buildvcs), the module's Dockerfile around it, then the
+  # container started on the staging profile against a real Postgres. It must run as non-root, answer
+  # /actuator/health 200 (the compose healthcheck's own wget), name this commit in /actuator/info, and
+  # stop on SIGTERM with exit 0 inside the compose grace (60 s).
+  image:
+    name: image
+    if: inputs.image_service != ''
+    runs-on: [self-hosted, "021"]
+    permissions:
+      contents: read
+    env:
+      # The PostGIS the modules' testkits pin, so the runners have it cached.
+      POSTGRES_IMAGE: imresamu/postgis:17-3.5-alpine@sha256:c7e4985375d8a9583e9bbdb33d0182138fa9a24d22ba9d7cc19362c4827b9038
+    defaults:
+      run:
+        working-directory: ${{ inputs.working_directory }}
+
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ inputs.go_version }}
+          cache: ${{ runner.environment != 'self-hosted' }}
+          cache-dependency-path: ${{ inputs.working_directory }}/go.sum
+
+      # The service's name reaches a path and a docker name: a plain name only.
+      - name: The binary, as the deploy builds it
+        env:
+          SERVICE: ${{ inputs.image_service }}
+        run: |
+          set -euo pipefail
+          if ! [[ "$SERVICE" =~ ^[a-z][a-z0-9-]*$ ]]; then
+            echo "::error::image_service must be a plain name (cmd/<it>)."
+            exit 1
+          fi
+          CGO_ENABLED=0 go build -trimpath -buildvcs=true -o "dist/${SERVICE}" "./cmd/${SERVICE}"
+
+      - name: The image, run as the host runs it
+        env:
+          SERVICE: ${{ inputs.image_service }}
+          SCHEMA: ${{ inputs.image_schema }}
+          EXTENSIONS: ${{ inputs.image_extensions }}
+          EXTRA_ENV: ${{ inputs.image_env }}
+        run: |
+          set -euo pipefail
+          if ! [[ "$SCHEMA" =~ ^[a-z_][a-z0-9_]*$ ]]; then
+            echo "::error::image_schema must be a plain schema name."
+            exit 1
+          fi
+          run="smoke-${SERVICE}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          image="${run}:image" pg="${run}-pg" svc="${run}-svc" envfile="$RUNNER_TEMP/${run}.env"
+          password=$(head -c 24 /dev/urandom | base64 | tr -d '/+=')
+          cleanup() {
+            docker rm -f "$svc" "$pg" >/dev/null 2>&1 || true
+            docker network rm "$run" >/dev/null 2>&1 || true
+            docker image rm "$image" >/dev/null 2>&1 || true
+            rm -f "$envfile"
+          }
+          trap cleanup EXIT
+          docker network create "$run" >/dev/null
+          docker run -d --name "$pg" --network "$run" -e POSTGRES_PASSWORD="$password" "$POSTGRES_IMAGE" >/dev/null
+          docker build -q -f Dockerfile -t "$image" . >/dev/null
+
+          # Non-root, as the image says and as it really runs.
+          user=$(docker image inspect -f '{{.Config.User}}' "$image")
+          uid=$(docker run --rm --entrypoint id "$image" -u)
+          if [ -z "$user" ] || [ "$user" = root ] || [ "$uid" = 0 ]; then
+            echo "::error::the image runs as root (USER '${user}', uid ${uid})."
+            exit 1
+          fi
+
+          # The schema and its owner made by the admin, as the host's seed makes them. Ready over TCP:
+          # the image's first start runs a socket-only server for its init scripts, then restarts.
+          ready=""
+          for _ in $(seq 60); do
+            if docker exec "$pg" pg_isready -h 127.0.0.1 -U postgres -q; then ready=yes; break; fi
+            sleep 1
+          done
+          if [ -z "$ready" ]; then
+            echo "::error::Postgres never became ready."
+            exit 1
+          fi
+          sql=(-c "CREATE ROLE svc LOGIN PASSWORD '${password}'" -c "CREATE SCHEMA ${SCHEMA} AUTHORIZATION svc")
+          for extension in $EXTENSIONS; do sql+=(-c "CREATE EXTENSION IF NOT EXISTS \"${extension}\""); done
+          docker exec "$pg" psql -U postgres -v ON_ERROR_STOP=1 -q "${sql[@]}"
+
+          {
+            echo "SPRING_PROFILES_ACTIVE=staging"
+            echo "SECRET_DB_URL=jdbc:postgresql://${pg}:5432/postgres"
+            echo "SECRET_DB_USERNAME=svc"
+            echo "SECRET_DB_PASSWORD=${password}"
+            while IFS= read -r line; do
+              [ -z "$line" ] && continue
+              if [ "${line#*=}" = "@random" ]; then line="${line%%=*}=$(head -c 48 /dev/urandom | base64 -w0)"; fi
+              echo "$line"
+            done <<< "$EXTRA_ENV"
+          } > "$envfile"
+          docker run -d --name "$svc" --network "$run" --env-file "$envfile" "$image" >/dev/null
+
+          healthy=""
+          for _ in $(seq 60); do
+            if docker exec "$svc" wget -q --spider http://127.0.0.1:8080/actuator/health 2>/dev/null; then healthy=yes; break; fi
+            [ "$(docker inspect -f '{{.State.Running}}' "$svc")" = true ] || break
+            sleep 1
+          done
+          if [ -z "$healthy" ]; then
+            echo "::error::/actuator/health never answered 200. The service's last lines:"
+            docker logs --tail 40 "$svc" 2>&1
+            exit 1
+          fi
+
+          commit=$(git rev-parse HEAD)
+          info=$(docker exec "$svc" wget -q -O - http://127.0.0.1:8080/actuator/info)
+          if ! grep -Eq "\"id\" *: *\"${commit}\"" <<< "$info"; then
+            echo "::error::/actuator/info does not name ${commit}: ${info}"
+            exit 1
+          fi
+
+          # compose's stop_grace_period is 60 s; a drain must end inside it, with exit 0.
+          start=$(date +%s)
+          docker stop -t 60 "$svc" >/dev/null
+          took=$(( $(date +%s) - start ))
+          code=$(docker inspect -f '{{.State.ExitCode}}' "$svc")
+          if [ "$code" != 0 ] || [ "$took" -ge 60 ]; then
+            echo "::error::SIGTERM: exit ${code} after ${took} s. The service's last lines:"
+            docker logs --tail 40 "$svc" 2>&1
+            exit 1
+          fi
+          echo "${SERVICE}: uid ${uid}, health 200, info names ${commit:0:8}, stopped in ${took} s with exit 0"

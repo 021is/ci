@@ -173,6 +173,14 @@ on:
           Polled ON THE HOST after restart, so it reports on the container that
           was just rolled rather than on whatever the public hostname resolves to.
           Empty skips the check — say why in the consumer if you do.
+      info_url:
+        required: false
+        type: string
+        default: ""
+        description: >-
+          Read ON THE HOST once health passes: its `git.commit.id` must be this run's full commit
+          (a Go twin stamps it from the checkout, `-buildvcs`), so a roll that left the other twin
+          running, or an older build, fails instead of passing on its health. Empty skips it.
       health_timeout:
         required: false
         type: number
@@ -500,6 +508,32 @@ jobs:
           done
           echo "❌ not healthy after ${TIMEOUT}s. Last 60 log lines:"
           cd "$REMOTE_PATH" && docker compose logs --tail=60 "$SERVICE"
+          exit 1
+          REMOTE
+          } | ssh "${USER}@${SSH_HOST}" 'bash -euo pipefail -s'
+
+      # Healthy says something answers; this says it is the build this run rolled.
+      - name: The running build is this commit
+        if: inputs.info_url != ''
+        env:
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          USER: ${{ inputs.remote_user }}
+        run: |
+          set -euo pipefail
+          {
+            printf 'INFO_URL=%q\n' '${{ inputs.info_url }}'
+            printf 'COMMIT=%q\n'   "$GITHUB_SHA"
+            cat <<'REMOTE'
+          info=""
+          for _ in $(seq 12); do
+            info=$(curl -sf --max-time 5 "$INFO_URL" || true)
+            if grep -Eq "\"id\" *: *\"${COMMIT}\"" <<< "$info"; then
+              echo "✅ ${INFO_URL} names ${COMMIT}"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "❌ ${INFO_URL} does not name ${COMMIT}: ${info}"
           exit 1
           REMOTE
           } | ssh "${USER}@${SSH_HOST}" 'bash -euo pipefail -s'

@@ -17,6 +17,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   its vcs stamp) and `image_var` (the whole image reference written to `.env`, the one line that
   says which of a service's twins runs; `tag_var` keeps naming the other, the way back). Both
   optional: every existing caller is unchanged.
+- `check-go.yml` `image_service` (with `image_schema`, `image_extensions`, `image_env`): a job
+  `image` that builds the deploy image and runs it as the host does: non-root, `/actuator/health`
+  200 against a real Postgres, `/actuator/info` naming the commit, SIGTERM exit 0 inside 60 s.
+  `ghcr-compose-deploy.yml` `info_url`: the roll fails unless the running build names its commit.
+  Both as DanceClub-Platform/ci's (TF96), one design.
 
 - `release-please.yml`: versions a repo from its conventional commits and tags `v<version>` when
   its release PR is merged, acting as a GitHub App (`RELEASE_APP_CLIENT_ID`,

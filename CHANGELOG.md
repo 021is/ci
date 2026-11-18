@@ -15,6 +15,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `multi-arch-image.yml`: one image for linux/amd64 + linux/arm64, each arch built natively (amd64
+  on `ubuntu-latest`, arm64 on `[self-hosted, "021"]` or `arm64_runner`), pushed by digest, merged
+  into one manifest list `<image>:sha-<sha_length>`, its two platforms read back from the registry
+  and both Trivy-scanned. Never QEMU: under it 021-site's amd64 `next build` passed 25 minutes.
+
 - `check-repo.yml`: the PR check floor for repos with no build of their own (every YAML and JSON
   file parses, every shell script passes `bash -n`, gitleaks over the tree and history), as
   `<caller job> / check`. `self-check.yml` runs it on this repo's own PRs.

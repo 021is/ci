@@ -32,6 +32,7 @@ That's it. Edit a workflow, commit, tag a release. Consumers pick up the change 
   - `pr-check-gradle.yml`, `ghcr-compose-deploy.yml`, `release-please.yml` — Kotlin/Gradle PR gate, GHCR image + compose roll, and release-please (as a GitHub App: `RELEASE_APP_CLIENT_ID` / `RELEASE_APP_PRIVATE_KEY`, org secrets); copied from DanceClub-Platform/ci (private, not callable from here), runner label `[self-hosted, "021"]` (private repos only). Re-sync by diff when that repo changes.
   - `check-go.yml` — the Go module gate (two jobs, `check` and `test`; tests `-race -shuffle=on`), reads 021is/code-rules with the release app's token; `ghcr-compose-deploy.yml`'s `go_module` / `image_var` build and switch a Go twin. Both ported from DanceClub-Platform/ci (2026-11-17, places' Go twin first).
   - `main-gated.yml` — on push to main, every new commit came through a merged PR whose head was green.
+  - `multi-arch-image.yml` — an image for amd64 + arm64, each built natively on its own arch's runner (never QEMU), pushed by digest, merged to `sha-<7>`, platforms checked, Trivy on both (TF149, 2026-11-18: under QEMU 021-site's amd64 `next build` passed 25 min).
 - `README.md` — humans + how to call from a consumer.
 - `CHANGELOG.md` — Keep-a-Changelog with `## [Unreleased]` block; `git tag v*` rolls via `git cliff`.
 

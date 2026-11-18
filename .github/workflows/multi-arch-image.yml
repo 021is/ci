@@ -53,7 +53,7 @@ on:
         required: false
         type: number
         default: 7
-        description: "Characters of the commit in the tag `sha-<…>` (the deploy repo's values name it)."
+        description: "Characters of the commit in the tag `sha-<…>`, 7 to 40 (the deploy repo's values name it)."
       registry_user:
         required: false
         type: string
@@ -116,30 +116,16 @@ jobs:
             echo "::error::this runner is $got; the $ARCH build must run natively (amd64_runner / arm64_runner)"
             exit 1
           fi
-          # The registry login lives in this job's temp folder, which the runner empties at the
-          # start and end of every job: nothing is left on a persistent runner's home.
-          echo "DOCKER_CONFIG=$RUNNER_TEMP/docker" >> "$GITHUB_ENV"
-
-      - name: Image coordinates
-        id: meta
-        env:
-          IMAGE: ${{ inputs.image }}
-        run: |
-          set -euo pipefail
-          if [ "$IMAGE" != "${IMAGE,,}" ] || [[ "$IMAGE" == *:* ]]; then
-            echo "::error::image must be lowercase and carry no tag, got '$IMAGE'"
-            exit 1
-          fi
-          echo "registry=${IMAGE%%/*}" >> "$GITHUB_OUTPUT"
 
       # Pinned by commit SHA; Dependabot proposes bumps.
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
-      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
-
-      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+      # Coordinates checked before any push, Buildx, the login in this job's temp folder. By
+      # commit like every action: a reusable workflow cannot name its own repo's files by path.
+      - uses: 021is/ci/.github/actions/image-registry@4eb2f9cc2e0efcb2d0622e4f14f0112c6866b2d9
         with:
-          registry: ${{ steps.meta.outputs.registry }}
+          image: ${{ inputs.image }}
+          sha_length: ${{ inputs.sha_length }}
           username: ${{ inputs.registry_user || github.actor }}
           password: ${{ secrets.REGISTRY_TOKEN || secrets.GITHUB_TOKEN }}
 
@@ -172,6 +158,11 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+      # The runners are persistent: the registry login leaves with the job, whatever happened.
+      - name: Remove the registry login
+        if: always()
+        run: rm -f "$RUNNER_TEMP/docker/config.json"
+
   merge:
     name: Manifest list
     needs: build
@@ -183,32 +174,19 @@ jobs:
     outputs:
       image: ${{ steps.meta.outputs.ref }}
     steps:
-      - name: Image coordinates
+      - uses: 021is/ci/.github/actions/image-registry@4eb2f9cc2e0efcb2d0622e4f14f0112c6866b2d9
         id: meta
-        env:
-          IMAGE: ${{ inputs.image }}
-          LENGTH: ${{ inputs.sha_length }}
-        run: |
-          set -euo pipefail
-          echo "DOCKER_CONFIG=$RUNNER_TEMP/docker" >> "$GITHUB_ENV"
-          {
-            echo "registry=${IMAGE%%/*}"
-            echo "ref=${IMAGE}:sha-${GITHUB_SHA:0:$LENGTH}"
-          } >> "$GITHUB_OUTPUT"
+        with:
+          image: ${{ inputs.image }}
+          sha_length: ${{ inputs.sha_length }}
+          username: ${{ inputs.registry_user || github.actor }}
+          password: ${{ secrets.REGISTRY_TOKEN || secrets.GITHUB_TOKEN }}
 
       - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
         with:
           pattern: digest-*
           merge-multiple: true
           path: ${{ runner.temp }}/digests
-
-      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
-
-      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
-        with:
-          registry: ${{ steps.meta.outputs.registry }}
-          username: ${{ inputs.registry_user || github.actor }}
-          password: ${{ secrets.REGISTRY_TOKEN || secrets.GITHUB_TOKEN }}
 
       - name: Merge the two digests into ${{ steps.meta.outputs.ref }}
         working-directory: ${{ runner.temp }}/digests
@@ -275,3 +253,8 @@ jobs:
             "$RUNNER_TEMP/trivy" image --platform "$platform" \
               --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 --no-progress "$REF"
           done
+
+      # The runners are persistent: the registry login leaves with the job, whatever happened.
+      - name: Remove the registry login
+        if: always()
+        run: rm -f "$RUNNER_TEMP/docker/config.json"

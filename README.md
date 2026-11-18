@@ -25,6 +25,7 @@ One source of truth for: deploy patterns, alert wiring, PR gates. Fix a bug here
 | [`pr-check-node.yml`](.github/workflows/pr-check-node.yml) | typecheck + lint + build dry-run for Node/TS repos on PRs. |
 | [`spine-quality-gate.yml`](.github/workflows/spine-quality-gate.yml) | The PR check for Spine-shaped repos: biome, typecheck, knip, madge, depcruise, spine-lint, audit, semgrep, tests and size, in parallel. |
 | [`spine-metrics.yml`](.github/workflows/spine-metrics.yml) | Post-merge: pushes a Spine repo's gate results, coverage, bundle size and Spine version to 021-mon (Prometheus remote-write + Loki). |
+| [`image-registry`](.github/actions/image-registry/action.yml) (composite action) | `multi-arch-image.yml`'s shared job start: the image's coordinates checked (lowercase, no tag, `sha_length` 7 to 40), Buildx, and a registry login in `$RUNNER_TEMP/docker`; the job's last, `always()` step removes that login. |
 | [`deploy-helvix`](.github/actions/deploy-helvix/action.yml) (composite action) | Builds and pushes the image, then opens a PR bumping `image.tag` in `021is/021-infra` that merges itself once its checks pass (main takes only PRs), and waits for that merge so Argo CD rolls the pod. Needs the `gh` CLI on the runner. |
 
 ## How to use from a consumer repo

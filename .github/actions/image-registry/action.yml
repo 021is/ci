@@ -1,0 +1,64 @@
+name: Image registry
+description: |
+  multi-arch-image.yml's shared start of a job: checks the image's coordinates before anything is
+  pushed, then Buildx and a registry login kept in this job's temp folder. The caller's job ends
+  with an `if: always()` step that removes "$RUNNER_TEMP/docker/config.json" (the runners are
+  persistent), since a composite action has no post step of its own.
+
+inputs:
+  image:
+    description: "The image repository without a tag, lowercase (multi-arch-image.yml's `image`)."
+    required: true
+  sha_length:
+    description: "Characters of the commit in the tag `sha-<…>`, 7 to 40."
+    required: true
+  username:
+    description: "Registry user."
+    required: true
+  password:
+    description: "Registry password or token."
+    required: true
+
+outputs:
+  registry:
+    description: "The registry host, the image's first path segment."
+    value: ${{ steps.meta.outputs.registry }}
+  ref:
+    description: "The manifest list's reference, `<image>:sha-<sha_length>`."
+    value: ${{ steps.meta.outputs.ref }}
+
+runs:
+  using: composite
+  steps:
+    - name: Image coordinates
+      id: meta
+      shell: bash
+      env:
+        IMAGE: ${{ inputs.image }}
+        LENGTH: ${{ inputs.sha_length }}
+      run: |
+        set -euo pipefail
+        if [ "$IMAGE" != "${IMAGE,,}" ] || [[ "$IMAGE" == *:* ]] || [[ "$IMAGE" != */* ]]; then
+          echo "::error::image must be lowercase, <registry>/<name> and carry no tag, got '$IMAGE'"
+          exit 1
+        fi
+        # Shorter than 7 is ambiguous across a repo's history; a commit has 40.
+        if ! [[ "$LENGTH" =~ ^[0-9]+$ ]] || [ "$LENGTH" -lt 7 ] || [ "$LENGTH" -gt 40 ]; then
+          echo "::error::sha_length must be 7 to 40, got '$LENGTH'"
+          exit 1
+        fi
+        # The login lands in this job's temp folder, never the persistent runner's home.
+        echo "DOCKER_CONFIG=$RUNNER_TEMP/docker" >> "$GITHUB_ENV"
+        {
+          echo "registry=${IMAGE%%/*}"
+          echo "ref=${IMAGE}:sha-${GITHUB_SHA:0:$LENGTH}"
+        } >> "$GITHUB_OUTPUT"
+
+    # Pinned by commit SHA; Dependabot proposes bumps.
+    - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+
+    - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+      with:
+        registry: ${{ steps.meta.outputs.registry }}
+        username: ${{ inputs.username }}
+        password: ${{ inputs.password }}

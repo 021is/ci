@@ -1,0 +1,260 @@
+name: Multi-arch image
+
+# Reusable workflow: one image for linux/amd64 AND linux/arm64, each built NATIVELY on a runner
+# of its own architecture (never under QEMU), pushed by digest, then merged into one manifest
+# list tagged `sha-<sha_length>`, its platforms checked and both scanned by Trivy. Nothing rolls:
+# a deploy names the tag elsewhere (021-infra's values.yaml, by PR).
+#
+# Why native: under QEMU a `next build` for amd64 on 021's ARM runners passed its 25-minute
+# timeout (021-site f545bce, 2026-11-18); natively it takes about two minutes. Why both: prod-k3s
+# is amd64 and the other hosts are ARM, so any app can move without a rebuild.
+#
+#   jobs:
+#     image:
+#       uses: 021is/ci/.github/workflows/multi-arch-image.yml@<commit>
+#       permissions: { contents: read, packages: write }
+#       with:
+#         image: ghcr.io/021is/my-app
+#       secrets:
+#         NPM_TOKEN: ${{ secrets.GPR_TOKEN }}   # only if the Dockerfile reads `npm_token`
+#
+# Runners: amd64 on GitHub's `ubuntu-latest` (billed minutes in a private repo), arm64 on the
+# org's own ARM slot `[self-hosted, "021"]` (private 021is repos only, no billed minutes). Another
+# org passes its own `arm64_runner`, e.g. `'"ubuntu-24.04-arm"'`. The merge runs on the arm64
+# runner too: it moves manifests only, so it should not cost hosted minutes.
+#
+# A Dockerfile whose build stage is `FROM --platform=$BUILDPLATFORM` still works: on a native
+# runner BUILDPLATFORM is the target, so a native module is compiled for the platform it runs on.
+
+on:
+  workflow_call:
+    inputs:
+      image:
+        required: true
+        type: string
+        description: >-
+          The image repository without a tag, lowercase: `ghcr.io/<org>/<name>` or
+          `registry.helvix.eu/<name>`. Its first path segment is the registry logged in to.
+      dockerfile:
+        required: false
+        type: string
+        default: Dockerfile
+        description: "Path to the Dockerfile, relative to the repo root."
+      build_context:
+        required: false
+        type: string
+        default: "."
+      build_args:
+        required: false
+        type: string
+        default: ""
+        description: "Newline-separated KEY=VALUE pairs (public values only: they stay in the image)."
+      sha_length:
+        required: false
+        type: number
+        default: 7
+        description: "Characters of the commit in the tag `sha-<…>`, 7 to 40 (the deploy repo's values name it)."
+      registry_user:
+        required: false
+        type: string
+        default: ""
+        description: "Registry user; empty means the run's actor (with GITHUB_TOKEN as the password)."
+      amd64_runner:
+        required: false
+        type: string
+        default: '"ubuntu-latest"'
+        description: "JSON runs-on for the amd64 build: a label string or an array of labels."
+      arm64_runner:
+        required: false
+        type: string
+        default: '["self-hosted", "021"]'
+        description: "JSON runs-on for the arm64 build and the merge: a label string or an array."
+    secrets:
+      REGISTRY_TOKEN:
+        required: false
+        description: "Registry password; empty means GITHUB_TOKEN (the caller grants packages: write)."
+      NPM_TOKEN:
+        required: false
+        description: >-
+          Handed to the Dockerfile as the build secret `npm_token`
+          (`RUN --mount=type=secret,id=npm_token`), never a build arg: no layer keeps it.
+    outputs:
+      image:
+        description: "The pushed manifest list, `<image>:sha-<…>`."
+        value: ${{ jobs.merge.outputs.image }}
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build ${{ matrix.arch }}
+    strategy:
+      # One arch failing means no manifest list: stop the other at once.
+      fail-fast: true
+      matrix:
+        include:
+          - arch: amd64
+            runner: ${{ inputs.amd64_runner }}
+          - arch: arm64
+            runner: ${{ inputs.arm64_runner }}
+    runs-on: ${{ fromJSON(matrix.runner) }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      # The runner's architecture must be the target's: a mislabelled runner would build under
+      # QEMU again, or fail late with `exec format error`.
+      - name: Native runner
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          case "$RUNNER_ARCH" in X64) got=amd64 ;; ARM64) got=arm64 ;; *) got="$RUNNER_ARCH" ;; esac
+          if [ "$got" != "$ARCH" ]; then
+            echo "::error::this runner is $got; the $ARCH build must run natively (amd64_runner / arm64_runner)"
+            exit 1
+          fi
+
+      # Pinned by commit SHA; Dependabot proposes bumps.
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      # Coordinates checked before any push, Buildx, the login in this job's temp folder. By
+      # commit like every action: a reusable workflow cannot name its own repo's files by path.
+      - uses: 021is/ci/.github/actions/image-registry@4eb2f9cc2e0efcb2d0622e4f14f0112c6866b2d9
+        with:
+          image: ${{ inputs.image }}
+          sha_length: ${{ inputs.sha_length }}
+          username: ${{ inputs.registry_user || github.actor }}
+          password: ${{ secrets.REGISTRY_TOKEN || secrets.GITHUB_TOKEN }}
+
+      # By digest only: no tag exists until both arches are pushed and merged below.
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        id: build
+        with:
+          context: ${{ inputs.build_context }}
+          file: ${{ inputs.dockerfile }}
+          build-args: ${{ inputs.build_args }}
+          secrets: ${{ secrets.NPM_TOKEN != '' && format('npm_token={0}', secrets.NPM_TOKEN) || '' }}
+          platforms: linux/${{ matrix.arch }}
+          outputs: type=image,name=${{ inputs.image }},push-by-digest=true,name-canonical=true,push=true
+          # Per arch: the two builds share no layers, and must not evict each other's cache.
+          cache-from: type=gha,scope=${{ inputs.image }}-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=${{ inputs.image }}-${{ matrix.arch }}
+
+      - name: Keep the digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/digests"
+          touch "$RUNNER_TEMP/digests/${DIGEST#sha256:}"
+
+      - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
+        with:
+          name: digest-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+      # The runners are persistent: the registry login leaves with the job, whatever happened.
+      - name: Remove the registry login
+        if: always()
+        run: rm -f "$RUNNER_TEMP/docker/config.json"
+
+  merge:
+    name: Manifest list
+    needs: build
+    runs-on: ${{ fromJSON(inputs.arm64_runner) }}
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.meta.outputs.ref }}
+    steps:
+      - uses: 021is/ci/.github/actions/image-registry@4eb2f9cc2e0efcb2d0622e4f14f0112c6866b2d9
+        id: meta
+        with:
+          image: ${{ inputs.image }}
+          sha_length: ${{ inputs.sha_length }}
+          username: ${{ inputs.registry_user || github.actor }}
+          password: ${{ secrets.REGISTRY_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        with:
+          pattern: digest-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/digests
+
+      - name: Merge the two digests into ${{ steps.meta.outputs.ref }}
+        working-directory: ${{ runner.temp }}/digests
+        env:
+          IMAGE: ${{ inputs.image }}
+          REF: ${{ steps.meta.outputs.ref }}
+        run: |
+          set -euo pipefail
+          sources=()
+          for d in *; do sources+=("${IMAGE}@sha256:${d}"); done
+          if [ "${#sources[@]}" != 2 ]; then
+            echo "::error::expected two digests (amd64, arm64), got ${#sources[@]}"
+            exit 1
+          fi
+          docker buildx imagetools create --tag "$REF" "${sources[@]}"
+
+      # The pushed tag must hold both platforms before anything may roll it (code-rules: image
+      # platforms), read back from the registry, not from what was sent.
+      - name: The manifest holds linux/amd64 and linux/arm64
+        env:
+          REF: ${{ steps.meta.outputs.ref }}
+        run: |
+          set -euo pipefail
+          docker buildx imagetools inspect "$REF"
+          platforms=$(docker buildx imagetools inspect "$REF" \
+            --format '{{range .Manifest.Manifests}}{{.Platform.OS}}/{{.Platform.Architecture}}{{"\n"}}{{end}}')
+          for want in linux/amd64 linux/arm64; do
+            if ! grep -qx "$want" <<< "$platforms"; then
+              echo "::error::$REF has no $want (it has: $(echo $platforms))"
+              exit 1
+            fi
+          done
+          echo "### \`$REF\`: linux/amd64 + linux/arm64" >> "$GITHUB_STEP_SUMMARY"
+
+      # Any HIGH or CRITICAL vulnerability that HAS a fix fails the run, on either platform, so a
+      # deploy never names this tag. Fixable only: an unfixed CVE is not actionable here. The tag
+      # is already pushed when this runs; it is never rolled.
+      #
+      # Trivy as its checksum-verified release binary (no third-party action code beside the
+      # registry token), the same pin as ghcr-compose-deploy.yml's scan.
+      - name: Scan both platforms (Trivy)
+        env:
+          VERSION: 0.75.0
+          # From the release's own trivy_0.75.0_checksums.txt, one per runner architecture.
+          SHA256_X64: c6e65abddb348e25f10549df887045629cf28cc72453cd1c63acb717316b3f3f
+          SHA256_ARM64: a1ee9f6ffb7d112b64ff726a2a0717c21175c1114361391f4a132956751a13b3
+          REF: ${{ steps.meta.outputs.ref }}
+          TRIVY_USERNAME: ${{ inputs.registry_user || github.actor }}
+          TRIVY_PASSWORD: ${{ secrets.REGISTRY_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          case "$RUNNER_ARCH" in
+            X64) ARCH=64bit SHA256=$SHA256_X64 ;;
+            ARM64) ARCH=ARM64 SHA256=$SHA256_ARM64 ;;
+            *) echo "no trivy pin for $RUNNER_ARCH" >&2; exit 1 ;;
+          esac
+          curl -sSfL -o "$RUNNER_TEMP/trivy.tgz" \
+            "https://github.com/aquasecurity/trivy/releases/download/v${VERSION}/trivy_${VERSION}_Linux-${ARCH}.tar.gz"
+          echo "${SHA256}  $RUNNER_TEMP/trivy.tgz" | sha256sum -c -
+          tar xzf "$RUNNER_TEMP/trivy.tgz" -C "$RUNNER_TEMP" trivy
+          # The database is fetched once, into this job's temp folder, for both scans.
+          export TRIVY_CACHE_DIR="$RUNNER_TEMP/trivy-cache"
+          for platform in linux/amd64 linux/arm64; do
+            "$RUNNER_TEMP/trivy" image --platform "$platform" \
+              --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 --no-progress "$REF"
+          done
+
+      # The runners are persistent: the registry login leaves with the job, whatever happened.
+      - name: Remove the registry login
+        if: always()
+        run: rm -f "$RUNNER_TEMP/docker/config.json"

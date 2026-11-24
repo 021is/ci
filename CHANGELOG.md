@@ -16,9 +16,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - `check-go.yml`: `danceclub_platform: true` for a 021 module on DanceClub's private platform
-  module: `check`, `test` and `image` each mint a read token for DanceClub-Platform/danceclub-platform
-  from the release app (installed in both orgs), through GIT_CONFIG_* and GOPRIVATE in the job's
-  environment only. First caller: 021is/designer.
+  module: `check` and `test` each mint a read token for DanceClub-Platform/danceclub-platform from
+  the release app (installed in both orgs) through the new composite action
+  `.github/actions/danceclub-platform-token`: the token in one git config file under RUNNER_TEMP
+  (0600), included by GIT_CONFIG_*, removed by an always-run step. `image` refuses the combination
+  (it starts a service with the Kotlin env names). First caller: 021is/designer.
 - `check-repo.yml`: the PR check floor for repos with no build of their own (every YAML and JSON
   file parses, every shell script passes `bash -n`, gitleaks over the tree and history), as
   `<caller job> / check`. `self-check.yml` runs it on this repo's own PRs.

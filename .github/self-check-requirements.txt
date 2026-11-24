@@ -1,0 +1,3 @@
+# self-check.yml's only dependency, pinned by hash (the manylinux x86_64 cp313 wheel from PyPI's
+# JSON for 6.0.3; ubuntu-latest, Python 3.13). A new version: take the hash from PyPI, not memory.
+PyYAML==6.0.3 --hash=sha256:0f29edc409a6392443abf94b9cf89ce99889a1dd5376d94316ae5145dfedd5d6

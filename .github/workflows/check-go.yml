@@ -174,9 +174,9 @@ jobs:
         working-directory: .
         run: echo "CODE_RULES_SHA=$(git -C .code-rules rev-parse HEAD)" >> "$GITHUB_ENV"
 
-      # This repo's own action at the commit that added it (a called workflow's `./` is the caller's
-      # checkout); the file it writes is removed by this job's last step, always.
-      - uses: 021is/ci/.github/actions/danceclub-platform-token@2c62b844aa63dadaaff1065d8d0a9879e1ac0ec0
+      # This repo's own action at main's commit that added it (a called workflow's `./` is the
+      # caller's checkout); the file it writes is removed by this job's last step, always.
+      - uses: 021is/ci/.github/actions/danceclub-platform-token@2cf9af4822920d72f932afa644e0fb64273b4733
         if: inputs.danceclub_platform
         with:
           client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
@@ -330,9 +330,9 @@ jobs:
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
-      # This repo's own action at the commit that added it (a called workflow's `./` is the caller's
-      # checkout); the file it writes is removed by this job's last step, always.
-      - uses: 021is/ci/.github/actions/danceclub-platform-token@2c62b844aa63dadaaff1065d8d0a9879e1ac0ec0
+      # This repo's own action at main's commit that added it (a called workflow's `./` is the
+      # caller's checkout); the file it writes is removed by this job's last step, always.
+      - uses: 021is/ci/.github/actions/danceclub-platform-token@2cf9af4822920d72f932afa644e0fb64273b4733
         if: inputs.danceclub_platform
         with:
           client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}

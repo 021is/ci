@@ -179,6 +179,7 @@ jobs:
       # This repo's own action at main's commit that added it (a called workflow's `./` is the
       # caller's checkout); the file it writes is removed by this job's last step, always.
       - uses: 021is/ci/.github/actions/danceclub-platform-token@2cf9af4822920d72f932afa644e0fb64273b4733
+        id: platform-token
         if: inputs.danceclub_platform
         with:
           client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
@@ -318,7 +319,9 @@ jobs:
       - name: The platform module's token removed
         if: always() && inputs.danceclub_platform
         working-directory: .
-        run: rm -f "$RUNNER_TEMP/danceclub-platform.gitconfig"
+        env:
+          CONFIG_FILE: ${{ steps.platform-token.outputs.config-file }}
+        run: rm -f "$CONFIG_FILE"
 
   test:
     name: test
@@ -335,6 +338,7 @@ jobs:
       # This repo's own action at main's commit that added it (a called workflow's `./` is the
       # caller's checkout); the file it writes is removed by this job's last step, always.
       - uses: 021is/ci/.github/actions/danceclub-platform-token@2cf9af4822920d72f932afa644e0fb64273b4733
+        id: platform-token
         if: inputs.danceclub_platform
         with:
           client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
@@ -382,7 +386,9 @@ jobs:
       - name: The platform module's token removed
         if: always() && inputs.danceclub_platform
         working-directory: .
-        run: rm -f "$RUNNER_TEMP/danceclub-platform.gitconfig"
+        env:
+          CONFIG_FILE: ${{ steps.platform-token.outputs.config-file }}
+        run: rm -f "$CONFIG_FILE"
 
   # The deploy image, built and run as the host runs it, beside `check` and `test`: the binary built as
   # ghcr-compose-deploy.yml builds it (static, -buildvcs), the module's Dockerfile around it, then the
@@ -408,6 +414,7 @@ jobs:
       # As in `check`: the binary below fetches DanceClub's platform module; the file it writes is
       # removed by this job's last step, always.
       - uses: 021is/ci/.github/actions/danceclub-platform-token@2cf9af4822920d72f932afa644e0fb64273b4733
+        id: platform-token
         if: inputs.danceclub_platform
         with:
           client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
@@ -457,7 +464,8 @@ jobs:
           docker network create "$run" >/dev/null
           docker run -d --name "$pg" --network "$run" -e POSTGRES_PASSWORD="$password" "$POSTGRES_IMAGE" >/dev/null
           # BuildKit, as the deploy's build: `COPY --chmod` needs it, and a runner whose Docker still
-          # defaults to the legacy builder refuses such a Dockerfile.
+          # defaults to the legacy builder refuses such a Dockerfile. The Dockerfile copies the binary
+          # built above (`dist/<service>`) and compiles nothing, so the build needs no token.
           if ! docker buildx version >/dev/null 2>&1; then
             echo "::error::this runner's Docker has no buildx (BuildKit): the deploy image cannot be built here."
             exit 1
@@ -487,10 +495,13 @@ jobs:
           for extension in $EXTENSIONS; do sql+=(-c "CREATE EXTENSION IF NOT EXISTS \"${extension}\""); done
           docker exec "$pg" psql -U postgres -v ON_ERROR_STOP=1 -q "${sql[@]}"
 
-          # A module on DanceClub's platform reads the platform's names (go/CODING-RULES.md
-          # § Configuration). NATS is away (the address answers nothing) and the service serves
-          # anyway, but its nkey seed must parse, so a throwaway user seed is made by nats-box.
-          nats_seed=""
+          # The names the service reads, chosen once. A module on DanceClub's platform reads the
+          # platform's (its go/CODING-RULES.md § Configuration): NATS is away (the address answers
+          # nothing) and the service serves anyway, but its nkey seed must parse, so nats-box makes a
+          # throwaway user seed. INGRESS_CIDRS names the one proxy whose X-Forwarded-For is read; the
+          # probes below call the service from inside its container (peer 127.0.0.1), so no proxy is
+          # in play and the CIDR need only parse: 192.0.2.1/32 is TEST-NET-1 (RFC 5737), which Docker
+          # never gives a container. Any other module reads the Kotlin-era names.
           if [ "$DANCECLUB_PLATFORM" = true ]; then
             nats_seed=$(docker run --rm natsio/nats-box@sha256:5162fca0f56ebe6f78e612e1ded143ce978e088393476033020e6251358dba6f nk -gen user)
             # A user seed is "SU" and 56 more base32 characters; anything else is a broken tool.
@@ -498,24 +509,16 @@ jobs:
               echo "::error::nats-box made no NATS user seed (nk -gen user), so the image cannot be proven."
               exit 1
             fi
+            names=("APP_ENV=staging" "PORT=8080" "DB_URL=postgres://${pg}:5432/postgres" "DB_USER=svc"
+              "SECRET_DB_PASSWORD=${password}" "NATS_URL=nats://127.0.0.1:1" "SECRET_NATS_SEED=${nats_seed}"
+              "INGRESS_CIDRS=192.0.2.1/32")
+          else
+            names=("SPRING_PROFILES_ACTIVE=staging" "SECRET_DB_URL=jdbc:postgresql://${pg}:5432/postgres"
+              "SECRET_DB_USERNAME=svc" "SECRET_DB_PASSWORD=${password}")
           fi
 
           {
-            if [ "$DANCECLUB_PLATFORM" = true ]; then
-              echo "APP_ENV=staging"
-              echo "PORT=8080"
-              echo "DB_URL=postgres://${pg}:5432/postgres"
-              echo "DB_USER=svc"
-              echo "SECRET_DB_PASSWORD=${password}"
-              echo "NATS_URL=nats://127.0.0.1:1"
-              echo "SECRET_NATS_SEED=${nats_seed}"
-              echo "INGRESS_CIDRS=172.18.0.2/32"
-            else
-              echo "SPRING_PROFILES_ACTIVE=staging"
-              echo "SECRET_DB_URL=jdbc:postgresql://${pg}:5432/postgres"
-              echo "SECRET_DB_USERNAME=svc"
-              echo "SECRET_DB_PASSWORD=${password}"
-            fi
+            printf '%s\n' "${names[@]}"
             while IFS= read -r line; do
               [ -z "$line" ] && continue
               if [ "${line#*=}" = "@random" ]; then line="${line%%=*}=$(head -c 48 /dev/urandom | base64 -w0)"; fi
@@ -558,4 +561,6 @@ jobs:
       - name: The platform module's token removed
         if: always() && inputs.danceclub_platform
         working-directory: .
-        run: rm -f "$RUNNER_TEMP/danceclub-platform.gitconfig"
+        env:
+          CONFIG_FILE: ${{ steps.platform-token.outputs.config-file }}
+        run: rm -f "$CONFIG_FILE"

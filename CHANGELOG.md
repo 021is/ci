@@ -9,15 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- `check-go.yml`: `image` takes `danceclub_platform: true` (it refused it). It mints the platform
-  module's read token the way `check` does, builds with BuildKit (`COPY --chmod`), and starts the
-  service with the platform's configuration names (`APP_ENV`, `DB_URL`, `DB_USER`,
-  `SECRET_DB_PASSWORD`, `NATS_URL`, `SECRET_NATS_SEED` made by nats-box, `INGRESS_CIDRS`). These
-  are DanceClub-Platform/ci's, so a 021 service on DanceClub's platform is smoke-tested as it runs.
-  A module without the flag keeps the Kotlin-era names. First caller: 021is/support (TF189).
 - `ghcr-compose-deploy.yml`: `danceclub_platform: true` for a `go_module` on DanceClub's private
-  platform module. The build mints the same read token (secrets `RELEASE_APP_CLIENT_ID` and
-  `RELEASE_APP_PRIVATE_KEY`, now declared) and removes it right after the binary is built.
+  platform module. The build mints the same read token as check-go.yml (secrets
+  `RELEASE_APP_CLIENT_ID` and `RELEASE_APP_PRIVATE_KEY`, now declared) and removes it right after
+  the binary is built.
 
 - `deploy-helvix`: the 021-infra bump is a PR that merges itself once 021-infra's checks pass,
   and the step waits for the merge (15 minutes at most), since 021-infra's main takes only PRs.
@@ -26,11 +21,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - `check-go.yml`: `danceclub_platform: true` for a 021 module on DanceClub's private platform
-  module: `check` and `test` each mint a read token for DanceClub-Platform/danceclub-platform from
-  the release app (installed in both orgs) through the new composite action
+  module: `check`, `test` and `image` each mint a read token for DanceClub-Platform/danceclub-platform
+  from the release app (installed in both orgs) through the new composite action
   `.github/actions/danceclub-platform-token`: the token in one git config file under RUNNER_TEMP
-  (0600), included by GIT_CONFIG_*, removed by an always-run step. `image` refuses the combination
-  (it starts a service with the Kotlin env names). First caller: 021is/designer.
+  (0600), included by GIT_CONFIG_*, removed by an always-run step that reads the action's
+  `config-file` output. With it, `image` builds with BuildKit (`COPY --chmod`) and starts the
+  service with the platform's configuration names (`APP_ENV`, `DB_URL`, `DB_USER`,
+  `SECRET_DB_PASSWORD`, `NATS_URL`, `SECRET_NATS_SEED` made by nats-box, `INGRESS_CIDRS`), as
+  DanceClub-Platform/ci does; without it, the Kotlin-era names. First callers: 021is/designer
+  (`check`, `test`); 021is/support (`image`, TF189: unproven until 021is/support's first PR run).
 - `check-repo.yml`: the PR check floor for repos with no build of their own (every YAML and JSON
   file parses, every shell script passes `bash -n`, gitleaks over the tree and history), as
   `<caller job> / check`. `self-check.yml` runs it on this repo's own PRs.

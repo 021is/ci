@@ -11,7 +11,7 @@ Coding rules: 021is/code-rules v0.6.0 (PRINCIPLES; workflows only, no language f
 
 - **Language:** YAML (GitHub Actions). No runtime code lives here.
 - **Versioning:** semver via git tags (`v1.0.0`, `v1.1.0`, …). Consumers pin `@v1`.
-- **Its own CI:** `self-check.yml` runs `check-repo.yml` from the same commit (`repo / check`, required by main's ruleset): every YAML/JSON parses, `bash -n`, gitleaks over the tree and history. The other reusable workflows run only when a consumer calls them.
+- **Its own CI:** `self-check.yml` runs `check-repo.yml` from the same commit (`repo / check`, required by main's ruleset): every YAML/JSON parses, `bash -n`, gitleaks over the tree and history; its `reusable concurrency` job holds the concurrency rule below (not required by the ruleset yet). The other reusable workflows run only when a consumer calls them.
 
 ## Boot
 
@@ -40,6 +40,7 @@ That's it. Edit a workflow, commit, tag a release. Consumers pick up the change 
 - **Inputs:** explicit `type:` + `description:` + sensible defaults. Required inputs go first.
 - **Secrets:** declared `required: true` so GitHub blocks calls without them. Use `secrets: inherit` in consumers — don't list each one.
 - **Concurrency:** `group: ${{ inputs.service }}-deploy` so two pushes to the same service don't race. `cancel-in-progress: true` for idempotent deploys; `false` for atomic-symlink ones (don't interrupt mid-swap).
+- **A reusable workflow's group is evaluated in the caller's context** (`github.workflow` is the caller's name): never start it with `${{ github.… }}`, or it can equal the group the caller holds and GitHub cancels the call (check-go's `${{ github.workflow }}-${{ github.ref }}` = elvix deploy's `deploy-refs/heads/main`, TF200). Start it with the workflow's own name (`check-go-…`); `self-check.yml`'s `reusable concurrency` job fails otherwise.
 - **Naming:** kebab-case files. `<deploy-style>-deploy.yml` for deploys, `pr-check-<runtime>.yml` for PR gates, `notify-<channel>.yml` for notifications.
 - **Failure path:** every deploy workflow ends with a `notify` job that calls `notify-failure.yml@main` on `failure()`. Don't write inline curl-to-AM scripts in consumers — they drift.
 - **Nothing stays on the runner:** SSH keys and known_hosts live in `$RUNNER_TEMP/ssh` (used with `ssh -F`), removed in an `always()` step; never `~/.ssh`. The runners are persistent.

@@ -70,8 +70,10 @@ on:
       GPR_TOKEN:
         required: false
 
+# Evaluated in the caller's context: our own prefix keeps it out of the caller's group names
+# (check-go.yml says why; self-check.yml holds the rule).
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: pr-check-gradle-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:

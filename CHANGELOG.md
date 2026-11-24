@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `check-go.yml`, `pr-check-gradle.yml`: the workflow-level concurrency group starts with the
+  workflow's own name (`check-go-…-<working_directory>`, `pr-check-gradle-…`). It was
+  `${{ github.workflow }}-${{ github.ref }}`, which a called workflow evaluates in the caller's
+  context: a caller holding that same group for itself (elvix `deploy`, `deploy-refs/heads/main`)
+  had the call cancelled, its jobs missing and its deploy skipped. A caller picks the fix up only
+  when it moves its pin. `self-check.yml` fails on such a group in any reusable workflow.
+
 ### Changed
 
 - `ghcr-compose-deploy.yml`: `danceclub_platform: true` for a `go_module` on DanceClub's private

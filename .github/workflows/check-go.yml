@@ -103,8 +103,14 @@ on:
       GO_MODULES_TOKEN:
         required: false
 
+# A called workflow's group is evaluated in the CALLER's context: `github.workflow` is the caller's
+# name, so a bare `${{ github.workflow }}-${{ github.ref }}` equals the group a caller holds for
+# itself (elvix's `deploy` held `deploy-refs/heads/main`), and GitHub cancelled this call: its jobs
+# never ran and the caller's deploy skipped (2026-11-17 to TF200). Our own prefix keeps the group
+# out of every caller's names; a newer run of the same caller on the same ref and module still
+# replaces the older one (self-check.yml holds the rule).
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: check-go-${{ github.workflow }}-${{ github.ref }}-${{ inputs.working_directory }}
   cancel-in-progress: true
 
 env:

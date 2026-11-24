@@ -44,8 +44,9 @@ name: GHCR + compose deploy
 # its own `image_name` (`<image>-go`) so the Kotlin twin's images and moving tag stay,
 # and `image_var` (`<SVC>_IMAGE`) so the roll writes the one line that says which twin
 # runs; `tag_var` keeps naming the Kotlin twin, the way back. Copied from
-# DanceClub-Platform/ci's, without its private-module token: a 021is Go module that
-# requires another private module is not supported yet.
+# DanceClub-Platform/ci's. A module on DanceClub's private platform module sets
+# `danceclub_platform: true` (the release app's read token, as check-go.yml); one that requires
+# another private 021is module is not supported yet.
 #
 # ⚠ `@main` until the release tag that carries this workflow exists (v1.2.0); pin that tag then.
 
@@ -136,6 +137,14 @@ on:
         type: string
         default: "1.27"
         description: "The Go release for `go_module` (its go.mod's `go` line), as check-go.yml."
+      danceclub_platform:
+        required: false
+        type: boolean
+        default: false
+        description: >-
+          `go_module` requires DanceClub's private platform module: the build mints a read token
+          for DanceClub-Platform/danceclub-platform from the release app (secrets
+          RELEASE_APP_CLIENT_ID, RELEASE_APP_PRIVATE_KEY), as check-go.yml's jobs do.
       image_var:
         required: false
         type: string
@@ -212,6 +221,12 @@ on:
       GPR_TOKEN:
         required: false
         description: "PAT with `read:packages` when `pre_build_cmd` or the Dockerfile (`npm_token`) resolves artifacts from a SIBLING repo's registry."
+      RELEASE_APP_CLIENT_ID:
+        required: false
+        description: "The release app's client id, with `danceclub_platform`."
+      RELEASE_APP_PRIVATE_KEY:
+        required: false
+        description: "The release app's private key, with `danceclub_platform`."
 
 # Per stage: the `build` and `roll` calls of one run must not cancel each other,
 # while a newer push still cancels an older run's build or roll.
@@ -285,7 +300,14 @@ jobs:
         run: ${{ inputs.pre_build_cmd }}
 
       # ── Go (`go_module`): one static binary for the hosts' architecture, built here and copied by
-      # the Dockerfile.
+      # the Dockerfile. With `danceclub_platform`, check-go.yml's token action at main's commit that
+      # added it; its file is removed right after the build, always.
+      - uses: 021is/ci/.github/actions/danceclub-platform-token@2cf9af4822920d72f932afa644e0fb64273b4733
+        if: inputs.go_module != '' && inputs.danceclub_platform
+        with:
+          client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         if: inputs.go_module != ''
         with:
@@ -310,6 +332,11 @@ jobs:
           export GOOS="${FIRST%%/*}" GOARCH="${FIRST#*/}"
           go build -trimpath -buildvcs=true -o "dist/${SERVICE}" "./cmd/${SERVICE}"
           go version -m "dist/${SERVICE}" | grep -E 'vcs\.(revision|modified)'
+
+      # The token serves the binary only: gone before Docker, the registry or Trivy run.
+      - name: The platform module's token removed
+        if: always() && inputs.go_module != '' && inputs.danceclub_platform
+        run: rm -f "$RUNNER_TEMP/danceclub-platform.gitconfig"
 
       - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
 

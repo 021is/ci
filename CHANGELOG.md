@@ -15,6 +15,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `SECRET_DB_PASSWORD`, `NATS_URL`, `SECRET_NATS_SEED` made by nats-box, `INGRESS_CIDRS`). These
   are DanceClub-Platform/ci's, so a 021 service on DanceClub's platform is smoke-tested as it runs.
   A module without the flag keeps the Kotlin-era names. First caller: 021is/support (TF189).
+- `ghcr-compose-deploy.yml`: `danceclub_platform: true` for a `go_module` on DanceClub's private
+  platform module. The build mints the same read token (secrets `RELEASE_APP_CLIENT_ID` and
+  `RELEASE_APP_PRIVATE_KEY`, now declared) and removes it right after the binary is built.
 
 - `deploy-helvix`: the 021-infra bump is a PR that merges itself once 021-infra's checks pass,
   and the step waits for the merge (15 minutes at most), since 021-infra's main takes only PRs.

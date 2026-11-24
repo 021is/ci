@@ -21,3 +21,40 @@ jobs:
     uses: ./.github/workflows/check-repo.yml
     with:
       runs_on: '["ubuntu-latest"]'
+
+  # A reusable workflow's concurrency group is evaluated in the caller's context, so a group that
+  # starts with the caller's own `github.*` values can equal the group the caller holds, and GitHub
+  # cancels the call (check-go.yml, TF200). Start it with the workflow's own name instead.
+  workflows:
+    name: reusable concurrency
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.13"
+      - run: python -m pip install --quiet PyYAML==6.0.3
+      - name: No reusable workflow's concurrency group starts with the caller's github values
+        run: |
+          python - <<'PY'
+          import glob, re, sys, yaml
+          bad = 0
+          for f in sorted(glob.glob(".github/workflows/*.yml")):
+              wf = yaml.safe_load(open(f))
+              on = wf.get("on", wf.get(True)) or {}  # YAML 1.1 reads a bare `on` as True
+              if "workflow_call" not in on:
+                  continue
+              places = [("workflow", wf.get("concurrency"))]
+              places += [(f"job {k}", j.get("concurrency")) for k, j in (wf.get("jobs") or {}).items()]
+              for where, c in places:
+                  group = c.get("group") if isinstance(c, dict) else c
+                  if group is None:
+                      continue
+                  if re.match(r"\s*\$\{\{\s*github\.", str(group)):
+                      bad += 1
+                      print(f"FAIL: {f} ({where}): group {group!r} starts with the caller's github values")
+                  else:
+                      print(f"ok: {f} ({where}): {group}")
+          sys.exit(1 if bad else 0)
+          PY

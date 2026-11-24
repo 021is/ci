@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `check-go.yml`: `image` takes `danceclub_platform: true` (it refused it). It mints the platform
+  module's read token the way `check` does, builds with BuildKit (`COPY --chmod`), and starts the
+  service with the platform's configuration names (`APP_ENV`, `DB_URL`, `DB_USER`,
+  `SECRET_DB_PASSWORD`, `NATS_URL`, `SECRET_NATS_SEED` made by nats-box, `INGRESS_CIDRS`). These
+  are DanceClub-Platform/ci's, so a 021 service on DanceClub's platform is smoke-tested as it runs.
+  A module without the flag keeps the Kotlin-era names. First caller: 021is/support (TF189).
+
 - `deploy-helvix`: the 021-infra bump is a PR that merges itself once 021-infra's checks pass,
   and the step waits for the merge (15 minutes at most), since 021-infra's main takes only PRs.
   Its commit drops `[skip ci]`, which would skip those checks.

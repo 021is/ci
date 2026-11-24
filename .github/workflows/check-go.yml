@@ -30,9 +30,11 @@ name: Check (Go)
 # requires another private 021is module is not supported yet: `test` holds no token.
 #
 # DanceClub's platform module (`danceclub_platform: true`, a 021 service built on
-# github.com/DanceClub-Platform/danceclub-platform/go, private): each job mints its own read token
-# for that one repo from the same release app (installed in both orgs), reaching git only through
-# GIT_CONFIG_* in the job's environment, never the runner's ~/.gitconfig.
+# github.com/DanceClub-Platform/danceclub-platform/go, private): `check` and `test` each mint their
+# own read token for that one repo from the same release app (installed in both orgs), through this
+# repo's .github/actions/danceclub-platform-token: the token in one git config file under
+# RUNNER_TEMP that GIT_CONFIG_* includes (never the runner's ~/.gitconfig, never the environment),
+# removed by each job's last step, always. `image` refuses it: it starts the Kotlin env names.
 #
 # ⚠ Runs on the 021is org's own slots (`[self-hosted, "021"]`): private 021is repos only.
 
@@ -86,8 +88,9 @@ on:
         type: boolean
         default: false
         description: >-
-          The module requires DanceClub's private platform module: every job mints a read token for
-          DanceClub-Platform/danceclub-platform from the release app (its secrets are required then).
+          The module requires DanceClub's private platform module: `check` and `test` mint a read
+          token for DanceClub-Platform/danceclub-platform from the release app (its secrets are
+          required then); `image_service` is refused with it (the image job's Kotlin env names).
 
     secrets:
       RELEASE_APP_CLIENT_ID:
@@ -171,28 +174,13 @@ jobs:
         working-directory: .
         run: echo "CODE_RULES_SHA=$(git -C .code-rules rev-parse HEAD)" >> "$GITHUB_ENV"
 
-      - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
-        id: platform
+      # This repo's own action at the commit that added it (a called workflow's `./` is the caller's
+      # checkout); the file it writes is removed by this job's last step, always.
+      - uses: 021is/ci/.github/actions/danceclub-platform-token@2c62b844aa63dadaaff1065d8d0a9879e1ac0ec0
         if: inputs.danceclub_platform
         with:
           client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
           private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
-          owner: DanceClub-Platform
-          repositories: danceclub-platform
-          permission-contents: read
-
-      - name: DanceClub's platform module through the token
-        if: inputs.danceclub_platform
-        working-directory: .
-        env:
-          TOKEN: ${{ steps.platform.outputs.token }}
-        run: |
-          {
-            echo "GIT_CONFIG_COUNT=1"
-            echo "GIT_CONFIG_KEY_0=url.https://x-access-token:${TOKEN}@github.com/DanceClub-Platform/.insteadOf"
-            echo "GIT_CONFIG_VALUE_0=https://github.com/DanceClub-Platform/"
-            echo "GOPRIVATE=github.com/DanceClub-Platform/*"
-          } >> "$GITHUB_ENV"
 
       # GitHub's cache only on GitHub's runners: on the org's own, the Go module, build and lint
       # caches are host folders that outlive the job.
@@ -325,6 +313,11 @@ jobs:
           echo "commits scanned: ${range} ($(git rev-list --count "$range"))"
           "$RUNNER_TEMP/bin/gitleaks" git --redact --no-banner --verbose --ignore-gitleaks-allow --log-opts="$range" .
 
+      - name: The platform module's token removed
+        if: always() && inputs.danceclub_platform
+        working-directory: .
+        run: rm -f "$RUNNER_TEMP/danceclub-platform.gitconfig"
+
   test:
     name: test
     runs-on: [self-hosted, "021"]
@@ -337,28 +330,13 @@ jobs:
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
-      - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
-        id: platform
+      # This repo's own action at the commit that added it (a called workflow's `./` is the caller's
+      # checkout); the file it writes is removed by this job's last step, always.
+      - uses: 021is/ci/.github/actions/danceclub-platform-token@2c62b844aa63dadaaff1065d8d0a9879e1ac0ec0
         if: inputs.danceclub_platform
         with:
           client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
           private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
-          owner: DanceClub-Platform
-          repositories: danceclub-platform
-          permission-contents: read
-
-      - name: DanceClub's platform module through the token
-        if: inputs.danceclub_platform
-        working-directory: .
-        env:
-          TOKEN: ${{ steps.platform.outputs.token }}
-        run: |
-          {
-            echo "GIT_CONFIG_COUNT=1"
-            echo "GIT_CONFIG_KEY_0=url.https://x-access-token:${TOKEN}@github.com/DanceClub-Platform/.insteadOf"
-            echo "GIT_CONFIG_VALUE_0=https://github.com/DanceClub-Platform/"
-            echo "GOPRIVATE=github.com/DanceClub-Platform/*"
-          } >> "$GITHUB_ENV"
 
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
@@ -399,6 +377,11 @@ jobs:
             exit 1
           fi
 
+      - name: The platform module's token removed
+        if: always() && inputs.danceclub_platform
+        working-directory: .
+        run: rm -f "$RUNNER_TEMP/danceclub-platform.gitconfig"
+
   # The deploy image, built and run as the host runs it, beside `check` and `test`: the binary built as
   # ghcr-compose-deploy.yml builds it (static, -buildvcs), the module's Dockerfile around it, then the
   # container started on the staging profile against a real Postgres. It must run as non-root, answer
@@ -418,30 +401,17 @@ jobs:
         working-directory: ${{ inputs.working_directory }}
 
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
-
-      - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
-        id: platform
-        if: inputs.danceclub_platform
-        with:
-          client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
-          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
-          owner: DanceClub-Platform
-          repositories: danceclub-platform
-          permission-contents: read
-
-      - name: DanceClub's platform module through the token
+      # The run below starts a service with the Kotlin env names (SPRING_PROFILES_ACTIVE,
+      # SECRET_DB_URL): a 021 Go service on DanceClub's platform reads others, so its image would
+      # pass here broken. Refused until this job writes the Go names.
+      - name: No image for a service on DanceClub's platform yet
         if: inputs.danceclub_platform
         working-directory: .
-        env:
-          TOKEN: ${{ steps.platform.outputs.token }}
         run: |
-          {
-            echo "GIT_CONFIG_COUNT=1"
-            echo "GIT_CONFIG_KEY_0=url.https://x-access-token:${TOKEN}@github.com/DanceClub-Platform/.insteadOf"
-            echo "GIT_CONFIG_VALUE_0=https://github.com/DanceClub-Platform/"
-            echo "GOPRIVATE=github.com/DanceClub-Platform/*"
-          } >> "$GITHUB_ENV"
+          echo "::error::image_service with danceclub_platform: this job starts the service with the Kotlin env names, not a Go service's. Leave image_service out until it writes the Go names."
+          exit 1
+
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:

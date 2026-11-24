@@ -1,0 +1,53 @@
+name: DanceClub's platform module
+description: |
+  A read token for DanceClub-Platform/danceclub-platform (private), minted from the release app
+  (installed in both orgs), so a 021 Go module built on DanceClub's platform module fetches it.
+  The token lives in one git config file under $RUNNER_TEMP (0600), included through GIT_CONFIG_*
+  in the job's environment, never the runner's ~/.gitconfig and never in the environment itself.
+  The calling job removes that file in an `if: always()` step (check-go.yml); the app token is
+  revoked when the job ends (create-github-app-token's post step).
+
+inputs:
+  client-id:
+    description: The release app's client id (RELEASE_APP_CLIENT_ID).
+    required: true
+  private-key:
+    description: The release app's private key (RELEASE_APP_PRIVATE_KEY).
+    required: true
+
+outputs:
+  config-file:
+    description: The git config file holding the token, for the job's always-run removal.
+    value: ${{ steps.config.outputs.file }}
+
+runs:
+  using: composite
+  steps:
+    - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+      id: token
+      with:
+        client-id: ${{ inputs.client-id }}
+        private-key: ${{ inputs.private-key }}
+        owner: DanceClub-Platform
+        repositories: danceclub-platform
+        permission-contents: read
+
+    - name: The token in a git config file, included by the job's environment
+      id: config
+      shell: bash
+      env:
+        TOKEN: ${{ steps.token.outputs.token }}
+      run: |
+        set -euo pipefail
+        file="$RUNNER_TEMP/danceclub-platform.gitconfig"
+        (
+          umask 077
+          printf '[url "https://x-access-token:%s@github.com/DanceClub-Platform/"]\n\tinsteadOf = https://github.com/DanceClub-Platform/\n' "$TOKEN" > "$file"
+        )
+        {
+          echo "GIT_CONFIG_COUNT=1"
+          echo "GIT_CONFIG_KEY_0=include.path"
+          echo "GIT_CONFIG_VALUE_0=$file"
+          echo "GOPRIVATE=github.com/DanceClub-Platform/*"
+        } >> "$GITHUB_ENV"
+        echo "file=$file" >> "$GITHUB_OUTPUT"

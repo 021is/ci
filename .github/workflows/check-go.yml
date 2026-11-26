@@ -84,6 +84,13 @@ on:
         description: >-
           More KEY=VALUE lines the service needs to start on the staging profile, never a real
           secret: a value `@random` becomes 48 random bytes, base64 (a guard key).
+      apt_packages:
+        required: false
+        type: string
+        default: ""
+        description: >-
+          Debian packages the tests run, space-separated, e.g. `tmux`: installed in the test job
+          before the tests (those already there are skipped). Empty: nothing is installed.
       danceclub_platform:
         required: false
         type: boolean
@@ -363,6 +370,29 @@ jobs:
           if ! command -v gcc >/dev/null; then
             sudo apt-get update -qq
             sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends gcc libc6-dev
+          fi
+
+      # What the module's tests run besides Go (the caller's apt_packages, e.g. tmux for a terminal
+      # the tests drive). Each name is checked by its shape first: a word that is not a Debian
+      # package name stops the job, so the input never reaches the shell as code.
+      - name: The packages the tests run
+        if: inputs.apt_packages != ''
+        env:
+          PACKAGES: ${{ inputs.apt_packages }}
+        run: |
+          set -euo pipefail
+          set -f # split on spaces only: a * stays a word, never the folder's files
+          missing=()
+          for p in $PACKAGES; do
+            if ! [[ "$p" =~ ^[a-z0-9][a-z0-9.+-]+$ ]]; then
+              echo "::error::apt_packages: '$p' is not a Debian package name"
+              exit 1
+            fi
+            dpkg -s "$p" >/dev/null 2>&1 || missing+=("$p")
+          done
+          if [ ${#missing[@]} -gt 0 ]; then
+            sudo apt-get update -qq
+            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends "${missing[@]}"
           fi
 
       # Real databases through Testcontainers, one package at a time: the slots share the CI box.
